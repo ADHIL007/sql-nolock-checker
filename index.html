@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SQL NOLOCK Professional Auditor</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;600;800&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app-container">
+        <header>
+            <div class="brand">
+                <div class="brand-text">
+                    <h1>NOLOCK AUDITOR</h1>
+                    <p>SQL Performance Tool</p>
+                </div>
+            </div>
+            <div class="actions">
+                <button id="analyzeBtn" class="primary-btn">RUN ANALYZE</button>
+                <button id="clearBtn" class="secondary-btn">CLEAR</button>
+            </div>
+        </header>
+
+        <main class="side-by-side">
+            <section class="editor-section">
+                <div class="panel-header">
+                    <span>Input SQL</span>
+                    <span class="kbd">CTRL + V</span>
+                </div>
+                <div class="editor-wrapper">
+                    <div id="lineNumbers" class="line-numbers"></div>
+                    <textarea id="sqlInput" spellcheck="false" placeholder="Paste your SQL procedure here..."></textarea>
+                </div>
+            </section>
+
+            <section class="results-section">
+                <div class="panel-header">
+                    <span id="summaryText">Ready to Analyze</span>
+                    <span id="issueCount" class="badge">0 Issues</span>
+                </div>
+                
+                <div id="resultsTableContainer" class="table-container hidden">
+                    <table id="resultsTable">
+                        <thead>
+                            <tr>
+                                <th>Line</th>
+                                <th>Table</th>
+                                <th>Snippet</th>
+                                <th>Issue</th>
+                            </tr>
+                        </thead>
+                        <tbody id="resultsBody">
+                            <!-- Results injected here -->
+                        </tbody>
+                    </table>
+                </div>
+
+                <div id="emptyState" class="empty-state">
+                    <h3>No Analysis Run</h3>
+                    <p>Paste SQL and click Run Analyze to start.</p>
+                </div>
+
+                <div id="allClearState" class="all-clear-state hidden">
+                    <h3>All Clear</h3>
+                    <p>No missing NOLOCK hints found in SELECT statements.</p>
+                </div>
+            </section>
+        </main>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>
