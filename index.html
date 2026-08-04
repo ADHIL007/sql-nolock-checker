@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SQL Tools &mdash; NOLOCK / NOCOUNT Auditor &amp; SQL Compare</title>
+    <link rel="stylesheet" href="vendor/codemirror/lib/codemirror.css">
     <link rel="stylesheet" href="style.css">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -12,13 +13,6 @@
 <body>
     <div class="app-container">
         <header>
-            <div class="brand">
-                <div class="brand-text">
-                    <h1>SQL TOOLS</h1>
-                    <p>NOLOCK / NOCOUNT Auditor &mdash; SQL Compare</p>
-                </div>
-            </div>
-
             <div class="mode-switch" id="modeSwitch">
                 <button class="mode active" data-mode="audit">AUDIT</button>
                 <button class="mode" data-mode="compare">COMPARE</button>
@@ -26,7 +20,7 @@
 
             <div class="actions" id="auditActions">
                 <button id="fixBtn" class="secondary-btn" title="Insert missing WITH (NOLOCK) / SET NOCOUNT ON" disabled>AUTO FIX</button>
-                <button id="undoBtn" class="secondary-btn hidden" title="Revert last auto fix">UNDO FIX</button>
+                <button id="undoBtn" class="secondary-btn" title="Revert last auto fix" disabled>UNDO FIX</button>
                 <button id="copyBtn" class="secondary-btn">COPY SQL</button>
                 <button id="exportBtn" class="secondary-btn" disabled>EXPORT</button>
                 <button id="analyzeBtn" class="primary-btn" title="Ctrl + Enter">RUN ANALYZE</button>
@@ -35,7 +29,6 @@
 
             <div class="actions hidden" id="compareActions">
                 <button id="swapBtn" class="secondary-btn" title="Swap the two sides">SWAP</button>
-                <button id="compareBtn" class="primary-btn" title="Ctrl + Enter">COMPARE</button>
                 <button id="clearCmpBtn" class="secondary-btn">CLEAR</button>
             </div>
         </header>
@@ -47,11 +40,13 @@
                     <span>Input SQL</span>
                     <span id="editorMeta" class="kbd">CTRL + ENTER TO ANALYZE</span>
                 </div>
-                <div class="editor-wrapper">
-                    <div id="lineNumbers" class="line-numbers"></div>
-                    <textarea id="sqlInput" spellcheck="false" placeholder="Paste your SQL procedure here..."></textarea>
+                <div class="editor-wrapper" id="auditDrop">
+                    <textarea id="sqlInput" spellcheck="false" placeholder="Paste your SQL procedure here, or drop a .sql file..."></textarea>
+                    <div class="drop-overlay hidden"><span>Drop .sql file to load</span></div>
                 </div>
             </section>
+
+            <div class="resizer" id="auditResizer" role="separator" aria-orientation="vertical" aria-label="Resize input and results" tabindex="0"></div>
 
             <section class="results-section">
                 <div class="panel-header">
@@ -59,9 +54,10 @@
                     <span id="issueCount" class="badge">0 Errors</span>
                 </div>
 
-                <div id="filterBar" class="filter-bar hidden">
+                <div id="filterBar" class="filter-bar">
                     <div class="tabs" id="tabs">
                         <button class="tab active" data-tab="all">ALL</button>
+                        <button class="tab" data-tab="security">SECURITY</button>
                         <button class="tab" data-tab="nolock">NO NOLOCK</button>
                         <button class="tab" data-tab="nocount">NO NOCOUNT</button>
                     </div>
@@ -85,58 +81,64 @@
 
                 <div id="emptyState" class="empty-state">
                     <h3>No Analysis Run</h3>
-                    <p>Paste SQL and click Run Analyze. Only two things are reported: read sources
-                       with no NOLOCK, and modules with no SET NOCOUNT ON.</p>
+                    <p>Paste or drop a .sql file, then Run Analyze. Reported: read sources with no
+                       NOLOCK, modules with no SET NOCOUNT ON, and injection / linked-server /
+                       plain-text credential risks in dynamic SQL.</p>
                 </div>
 
                 <div id="allClearState" class="all-clear-state hidden">
                     <h3>All Clear</h3>
-                    <p>Every read source has NOLOCK and every module sets NOCOUNT ON.</p>
+                    <p>Every read source has NOLOCK, every module sets NOCOUNT ON, and no security issues found.</p>
                 </div>
             </section>
         </main>
 
         <!-- =============================== COMPARE =============================== -->
         <main class="compare-view hidden" id="compareView">
-            <div class="compare-inputs">
-                <section class="cmp-pane">
-                    <div class="panel-header">
-                        <span>Original SQL</span>
-                        <span id="leftMeta" class="kbd">0 LINES</span>
-                    </div>
-                    <textarea id="leftInput" spellcheck="false" placeholder="Paste the original / production SQL here..."></textarea>
-                </section>
-                <section class="cmp-pane">
-                    <div class="panel-header">
-                        <span>Modified SQL</span>
-                        <span id="rightMeta" class="kbd">0 LINES</span>
-                    </div>
-                    <textarea id="rightInput" spellcheck="false" placeholder="Paste the changed SQL here..."></textarea>
-                </section>
-            </div>
-
             <div class="cmp-toolbar">
                 <label class="opt"><input type="checkbox" id="optCase"> Ignore case</label>
-                <label class="opt"><input type="checkbox" id="optWs"> Ignore whitespace</label>
+                <label class="opt"><input type="checkbox" id="optWs" checked> Ignore whitespace</label>
                 <label class="opt"><input type="checkbox" id="optCmt"> Ignore comments</label>
-                <label class="opt"><input type="checkbox" id="optOnly" checked> Differences only</label>
                 <span class="cmp-spacer"></span>
-                <span id="diffSummary" class="diff-summary">Not compared</span>
+                <span id="diffSummary" class="diff-summary">Paste SQL into both panes</span>
                 <button id="prevDiffBtn" class="nav-btn" title="Previous difference" disabled>&#9650;</button>
                 <button id="nextDiffBtn" class="nav-btn" title="Next difference" disabled>&#9660;</button>
             </div>
 
-            <div id="diffContainer" class="diff-container">
-                <div class="empty-state">
-                    <h3>Nothing Compared Yet</h3>
-                    <p>Paste SQL into both panes and click Compare.</p>
-                </div>
+            <div class="compare-inputs">
+                <section class="cmp-pane" id="leftDrop">
+                    <div class="panel-header">
+                        <span>Original SQL</span>
+                        <span id="leftMeta" class="kbd">0 LINES</span>
+                    </div>
+                    <div class="editor-wrapper">
+                        <textarea id="leftInput" spellcheck="false" placeholder="Paste or type the original / production SQL here, or drop a .sql file..."></textarea>
+                        <div class="drop-overlay hidden"><span>Drop .sql file to load</span></div>
+                    </div>
+                </section>
+
+                <div class="resizer" id="cmpResizer" role="separator" aria-orientation="vertical" aria-label="Resize the two panes" tabindex="0"></div>
+
+                <section class="cmp-pane" id="rightDrop">
+                    <div class="panel-header">
+                        <span>Modified SQL</span>
+                        <span id="rightMeta" class="kbd">0 LINES</span>
+                    </div>
+                    <div class="editor-wrapper">
+                        <textarea id="rightInput" spellcheck="false" placeholder="Paste or type the changed SQL here, or drop a .sql file..."></textarea>
+                        <div class="drop-overlay hidden"><span>Drop .sql file to load</span></div>
+                    </div>
+                </section>
             </div>
         </main>
     </div>
     <div id="toast" class="toast hidden"></div>
     <!-- jsdiff (github.com/kpdecker/jsdiff, BSD-3-Clause) - vendored, no network needed -->
     <script src="vendor/diff.min.js"></script>
+    <!-- CodeMirror 5 (codemirror.net, MIT) - vendored, no network needed -->
+    <script src="vendor/codemirror/lib/codemirror.js"></script>
+    <script src="vendor/codemirror/addon/mode/overlay.js"></script>
+    <script src="vendor/codemirror/mode/sql/sql.js"></script>
     <script src="script.js"></script>
 </body>
 </html>

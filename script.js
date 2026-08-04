@@ -55,15 +55,63 @@ const PSEUDO_TABLES = new Set(['INSERTED', 'DELETED']);
 /* Tokens that turn a following FROM into a cursor fetch rather than a table source. */
 const CURSOR_FETCH = new Set(['FETCH', 'NEXT', 'PRIOR', 'FIRST', 'LAST', 'ABSOLUTE', 'RELATIVE']);
 
-/* Only two things are reported: a read source with no NOLOCK, and a module
-   body with no SET NOCOUNT ON. Everything else stays silent. */
+/* Reported: a read source with no NOLOCK, a module body with no SET NOCOUNT ON,
+   and the three security problems (injection, remote execution, credentials).
+   Everything else stays silent. */
 const RULES = {
-    NL001: { cat: 'nolock',  msg: 'No NOLOCK on read source' },
-    NL005: { cat: 'nolock',  msg: 'No NOLOCK inside dynamic SQL' },
-    NC001: { cat: 'nocount', msg: 'Module body missing SET NOCOUNT ON' },
-    NC002: { cat: 'nocount', msg: 'SET NOCOUNT turned OFF again' },
-    NC004: { cat: 'nocount', msg: 'Batch missing SET NOCOUNT ON' }
+    NL001: { cat: 'nolock',   msg: 'No NOLOCK on read source' },
+    NL005: { cat: 'nolock',   msg: 'No NOLOCK inside dynamic SQL' },
+    NC001: { cat: 'nocount',  msg: 'Module body missing SET NOCOUNT ON' },
+    NC002: { cat: 'nocount',  msg: 'SET NOCOUNT turned OFF again' },
+    NC004: { cat: 'nocount',  msg: 'Batch missing SET NOCOUNT ON' },
+    SEC001: { cat: 'security', msg: 'String parameter concatenated into executed dynamic SQL' },
+    SEC002: { cat: 'security', msg: 'Caller supplied identifier or predicate in dynamic SQL' },
+    SEC003: { cat: 'security', msg: 'Dynamic SQL executed against a linked server' },
+    SEC004: { cat: 'security', msg: 'Credential in plain text' }
 };
+
+/* ------------------------- security analysis vocabulary ------------------- */
+
+const STRING_TYPES = new Set([
+    'VARCHAR', 'NVARCHAR', 'CHAR', 'NCHAR', 'TEXT', 'NTEXT', 'SYSNAME', 'XML'
+]);
+
+/* Types that cannot carry an injection payload once concatenated. */
+const SAFE_TYPES = new Set([
+    'INT', 'INTEGER', 'BIGINT', 'SMALLINT', 'TINYINT', 'BIT', 'DECIMAL', 'NUMERIC',
+    'MONEY', 'SMALLMONEY', 'FLOAT', 'REAL', 'DATE', 'DATETIME', 'DATETIME2',
+    'SMALLDATETIME', 'DATETIMEOFFSET', 'TIME', 'UNIQUEIDENTIFIER', 'TIMESTAMP',
+    'BINARY', 'VARBINARY', 'IMAGE'
+]);
+
+/* Parameter names that mean "caller hands us raw SQL" - the recurring design
+   flaw found across the SIP procedures (@WhereClause, @TableName, ...). */
+const IDENT_PARAM_RE = /(TABLE|COLUMN|FIELD|ORDER|SORT|WHERE|CLAUSE|CONDITION|PREDICATE|FILTER|CRITERIA|SQL|QUERY|STMT|SELECTLIST|GROUPBY|HAVING|JOIN)/;
+
+const REMOTE_FUNCS = /\b(OPENQUERY|OPENROWSET|OPENDATASOURCE)\s*\(/gi;
+
+/* Credential shapes: connection strings, linked-server logins, CREATE LOGIN,
+   scoped credentials. Values are redacted before they are ever displayed.
+
+   Deliberately quoted-literal-only ('...' / N'...') on the right of "=". This
+   codebase's login procedures are full of `Password=(case when ... else
+   @Password end)` and `Password=@Password` - a column compared against an
+   expression or a passed-through parameter, not a hardcoded secret. Matching
+   a bare unquoted token would flag "(case" as a credential on almost every
+   login proc. Real hardcoded creds in these scripts are always a string
+   literal, so requiring one keeps this to genuine hits. */
+const SECRET_PATTERNS = [
+    { re: /\b(pass\s*word|pwd|passwd)\s*=\s*(N?'[^']*')/gi, what: 'password' },
+    { re: /@rmtpassword\s*=\s*(N?'[^']*')/gi, what: 'linked server remote password' },
+    { re: /\b(secret)\s*=\s*(N?'[^']*')/gi, what: 'credential secret' }
+];
+
+/* "User ID=x;Password=y" connection-string idiom. Scoped to a single string
+   literal (see analyzeSecurity) so it can never pair a "userid=" on one line
+   with an unrelated "password" many lines later - T-SQL statements do not
+   require a terminating ';', so an unbounded scan across the whole script
+   would do exactly that. */
+const CONN_STRING_RE = /\b(user\s*id|uid)\s*=\s*([^;'"]+)\s*;[^;]{0,120}?\b(pass\s*word|pwd)\s*=\s*([^;'"]*)/gi;
 
 /* --------------------------- span lexer / masking -------------------------- */
 
@@ -519,6 +567,379 @@ function analyzeNoCount(sql, codeDoc, lineOf, findings) {
     return { mods: mods, missing: missing };
 }
 
+/* ============================ security analysis ============================
+   Mirrors the review done on the SIP database: a dynamic SQL string that is
+   executed is only a problem when a caller supplied value reaches it. Values
+   that come from a config table (PMSSettings.SIPServer, pmsTradingMember ...)
+   and values with a non-string type are not caller controlled, so they stay
+   silent - that is what keeps this from firing on every EXEC(@Sql).
+   ========================================================================== */
+
+/* @name <type> pairs out of a parameter list or a DECLARE statement. */
+function readDeclarations(text, isParam, into) {
+    const re = /@(\w+)\s+(?:AS\s+)?([A-Za-z_]\w*)\s*(?:\(\s*([\w,\s]*)\s*\))?/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+        const name = m[1].toUpperCase();
+        const type = m[2].toUpperCase();
+        if (!STRING_TYPES.has(type) && !SAFE_TYPES.has(type) && type !== 'TABLE') continue;
+        if (into.has(name)) continue;
+        into.set(name, {
+            name: m[1],
+            type: type,
+            size: m[3] || '',
+            isParam: isParam,
+            /* char(1) style parameters cannot hold a payload */
+            tainted: isParam && STRING_TYPES.has(type) && !/^1$/.test((m[3] || '').trim()),
+            fromTable: false,
+            evidence: []
+        });
+    }
+}
+
+function collectVariables(sql, codeDoc) {
+    const vars = new Map();
+
+    /* module parameter lists */
+    findModules(codeDoc).forEach(mod => {
+        readDeclarations(codeDoc.slice(mod.headerEnd, bodyStart(codeDoc, mod)), true, vars);
+    });
+
+    /* DECLARE blocks */
+    const re = /\bDECLARE\b/gi;
+    let m;
+    while ((m = re.exec(codeDoc)) !== null) {
+        const rest = codeDoc.slice(m.index + 7, m.index + 4000);
+        const stop = rest.search(/\n\s*(SET|SELECT|INSERT|UPDATE|DELETE|IF|BEGIN|END|EXEC|EXECUTE|PRINT|RETURN|WHILE|CREATE|DROP|FETCH|OPEN|CLOSE|DEALLOCATE|GO)\b/i);
+        readDeclarations(stop < 0 ? rest : rest.slice(0, stop), false, vars);
+    }
+    return vars;
+}
+
+/* Split a statement body into `@var = expr` segments at top level commas -
+   paren depth is tracked so a function call's own commas ("Fn(1,2)") don't
+   split it. Shared by SET/SELECT assignments and DECLARE initializers, which
+   both allow a comma separated list of the same shape. */
+function splitTopLevel(body) {
+    const toks = tokenize(body);
+    let depth = 0, segStart = 0;
+    const segs = [];
+    for (let i = 0; i < toks.length; i++) {
+        const t = toks[i];
+        if (t.v === '(') depth++;
+        else if (t.v === ')') depth--;
+        else if (t.v === ',' && depth === 0) {
+            segs.push(body.slice(segStart, t.s));
+            segStart = t.e;
+        }
+    }
+    segs.push(body.slice(segStart));
+    return segs;
+}
+
+const ASSIGN_STOP_RE = /\n\s*(SET|SELECT|INSERT|UPDATE|DELETE|IF|ELSE|BEGIN|END|EXEC|EXECUTE|PRINT|RETURN|WHILE|CREATE|DROP|FETCH|OPEN|CLOSE|DEALLOCATE|DECLARE|GO)\b/i;
+
+/* Every SET/SELECT assignment to a variable, with the right hand side kept
+   intact so the quoting around a concatenated parameter can be inspected.
+
+   The SIP procedures almost always read config values with a single
+   multi-column statement: "Select @SIPServer=SIPServer, @SIPDb = SIPDb, ...
+   From PMSSettings(nolock)". Treating that as one assignment (as a naive
+   "SET|SELECT @x =" regex does) only ever catches the first column - every
+   other variable in the list would look like it came from nowhere and get
+   flagged "confirm where it is set" instead of "from a config table, safe".
+   So each statement's column list is split into segments, and "reads from a
+   real table" is judged once per statement and applied to every variable
+   that statement assigns. */
+function collectAssignments(noCmt) {
+    const out = [];
+    const headRe = /\b(?:SET|SELECT)\s+(?=@\w+\s*=)/gi;
+    let hm;
+    while ((hm = headRe.exec(noCmt)) !== null) {
+        const from = hm.index + hm[0].length;
+        const rest = noCmt.slice(from, from + 8000);
+        const stop = rest.search(ASSIGN_STOP_RE);
+        const body = stop < 0 ? rest : rest.slice(0, stop);
+        const fromTable = /\bFROM\b/i.test(body) && !/\+/.test(body);
+
+        let pos = 0;
+        splitTopLevel(body).forEach(seg => {
+            const am = /^\s*@(\w+)\s*=\s*/i.exec(seg);
+            if (am) {
+                out.push({
+                    target: am[1].toUpperCase(),
+                    s: from + pos + am[0].length,
+                    rhs: seg.slice(am[0].length),
+                    fromTable: fromTable
+                });
+            }
+            pos += seg.length + 1;         /* +1 for the comma consumed between segments */
+        });
+    }
+    return out;
+}
+
+/* `DECLARE @sql VARCHAR(MAX) = 'select ... ' + @param` initializes and
+   concatenates in the same statement - a separate shape from SET/SELECT, but
+   just as common a sink, and just as able to carry a tainted parameter
+   straight into a variable that later gets executed. */
+function collectDeclareInits(noCmt) {
+    const out = [];
+    const headRe = /\bDECLARE\s+/gi;
+    let hm;
+    while ((hm = headRe.exec(noCmt)) !== null) {
+        const from = hm.index + hm[0].length;
+        const rest = noCmt.slice(from, from + 8000);
+        const stop = rest.search(ASSIGN_STOP_RE);
+        const body = stop < 0 ? rest : rest.slice(0, stop);
+
+        let pos = 0;
+        splitTopLevel(body).forEach(seg => {
+            const dm = /^\s*@(\w+)\s+(?:AS\s+)?[A-Za-z_][\w.]*\s*(?:\([^)]*\))?\s*=\s*/i.exec(seg);
+            if (dm) {
+                out.push({
+                    target: dm[1].toUpperCase(),
+                    s: from + pos + dm[0].length,
+                    rhs: seg.slice(dm[0].length),
+                    fromTable: /\bFROM\b/i.test(seg) && !/\+/.test(seg)
+                });
+            }
+            pos += seg.length + 1;
+        });
+    }
+    return out;
+}
+
+/* Is @param inside a quoted literal in the generated SQL, or bare?  The chunk
+   of literal immediately before "'+@p" ends with an escaped quote ('') when the
+   value lands inside quotes; anything else means it lands as raw SQL. */
+function concatContext(rhs, at) {
+    const before = rhs.slice(Math.max(0, at - 40), at);
+    if (/''\s*'?\s*\+\s*$/.test(before) || /''\s*$/.test(before.replace(/\s*\+\s*$/, ''))) return 'quoted';
+    if (/(=|,|\(|\bLIKE\b|\bIN\b|\bAND\b|\bOR\b|\bWHERE\b|\bVALUES\b)\s*'?\s*\+?\s*$/i.test(before)) return 'bare';
+    return 'bare';
+}
+
+function isSanitized(rhs, at) {
+    const before = rhs.slice(Math.max(0, at - 120), at);
+    return /\b(QUOTENAME|REPLACE|CONVERT|CAST|STR|FORMAT|ISNUMERIC|TRY_CONVERT|TRY_CAST)\s*\([^()]*$/i.test(before);
+}
+
+function analyzeSecurity(sql, codeDoc, spans, lineOf, findings) {
+    const noCmt = blankSpans(sql, spans.comments);      /* literals kept intact */
+    const vars = collectVariables(sql, codeDoc);
+    const assigns = collectAssignments(noCmt).concat(collectDeclareInits(noCmt))
+        .sort((a, b) => a.s - b.s);
+
+    function add(rule, off, obj, msg) {
+        const f = mkFinding(rule, lineOf(off), obj, msg, snipAt(sql, off), null);
+        f.off = off;
+        findings.push(f);
+    }
+
+    /* ---- taint propagation over the assignments, in source order ----
+       Only an actual parameter starts as tainted. Every var also carries
+       `origin`, the parameter that first tainted it, so a flow reported many
+       hops later (@sql2 = @sql1, ... EXEC(@sql2)) still names the real
+       parameter instead of the intermediate accumulator variable. A line like
+       `SET @sql = @sql + ... + @clientid` must not treat @sql-referencing-
+       itself as a new taint source - that produced a bogus "parameter @sql"
+       finding, since @sql is the accumulator being inspected, not a caller
+       supplied value. */
+    const flows = [];                       /* {target, param, off, ctx, ident} */
+    for (let pass = 0; pass < 2; pass++) {
+        assigns.forEach(a => {
+            const v = vars.get(a.target);
+            if (a.fromTable && v) v.fromTable = true;   /* read out of a table */
+            const pre = /@(\w+)/g;
+            let pm;
+            while ((pm = pre.exec(a.rhs)) !== null) {
+                const srcName = pm[1].toUpperCase();
+                if (srcName === a.target) continue;      /* self accumulation, no new taint */
+                const src = vars.get(srcName);
+                if (!src || !src.tainted) continue;
+                if (isSanitized(a.rhs, pm.index)) continue;
+                const origin = src.origin || (src.isParam ? src : null);
+                if (!origin) continue;
+                if (v) { v.tainted = true; v.origin = v.origin || origin; }
+                if (pass === 0) {
+                    flows.push({
+                        target: a.target,
+                        param: origin,
+                        off: a.s + pm.index,
+                        ctx: concatContext(a.rhs, pm.index),
+                        ident: origin.isParam && IDENT_PARAM_RE.test(origin.name.toUpperCase())
+                    });
+                }
+            }
+        });
+    }
+
+    /* ---- execution sinks ---- */
+    const sinks = [];
+    const execRe = /\b(?:EXEC|EXECUTE)\s*\(/gi;
+    let m;
+    while ((m = execRe.exec(noCmt)) !== null) {
+        const toks = tokenize(noCmt.slice(m.index));
+        const open = toks.findIndex(t => t.v === '(');
+        const close = open >= 0 ? matchParen(toks, open) : -1;
+        const inner = close > 0 ? noCmt.slice(m.index + toks[open].e, m.index + toks[close].s) : '';
+        sinks.push({ off: m.index, inner: inner, how: 'EXEC()' });
+    }
+    const spRe = /\bsp_executesql\b/gi;
+    while ((m = spRe.exec(noCmt)) !== null) {
+        const rest = noCmt.slice(m.index, m.index + 400);
+        /* a real parameter list means the statement is parameterised */
+        const parameterised = /,\s*N?'\s*@/.test(rest);
+        sinks.push({ off: m.index, inner: rest.split(/\n/)[0], how: 'sp_executesql', parameterised: parameterised });
+    }
+    /* OPENQUERY / OPENROWSET / OPENDATASOURCE also run their query text
+       verbatim on the remote server - a tainted parameter reaching the query
+       argument is just as much an injection sink as EXEC(). */
+    REMOTE_FUNCS.lastIndex = 0;
+    while ((m = REMOTE_FUNCS.exec(noCmt)) !== null) {
+        const toks = tokenize(noCmt.slice(m.index));
+        const open = toks.findIndex(t => t.v === '(');
+        const close = open >= 0 ? matchParen(toks, open) : -1;
+        const inner = close > 0 ? noCmt.slice(m.index + toks[open].e, m.index + toks[close].s) : '';
+        sinks.push({ off: m.index, inner: inner, how: m[1].toUpperCase() + '(...)' });
+    }
+
+    const reported = new Set();
+
+    sinks.forEach(sink => {
+        const used = new Set();
+        let vm;
+        const vre = /@(\w+)/g;
+        while ((vm = vre.exec(sink.inner)) !== null) used.add(vm[1].toUpperCase());
+
+        /* inline payload: EXEC('... ' + @param + ' ...') with no variable */
+        used.forEach(u => {
+            const v = vars.get(u);
+            if (v && v.tainted && v.isParam && !sink.parameterised) {
+                const key = 'inline:' + u + ':' + sink.off;
+                if (!reported.has(key)) {
+                    reported.add(key);
+                    add(v.isParam && IDENT_PARAM_RE.test(v.name.toUpperCase()) ? 'SEC002' : 'SEC001',
+                        sink.off, '@' + v.name,
+                        'CRITICAL: parameter @' + v.name + ' (' + v.type.toLowerCase() +
+                        ') is concatenated straight into ' + sink.how + ' - SQL injection');
+                }
+            }
+        });
+
+        if (sink.parameterised) return;
+
+        flows.forEach(fl => {
+            if (!used.has(fl.target)) return;
+            const key = fl.param.name + ':' + fl.off;
+            if (reported.has(key)) return;
+            reported.add(key);
+
+            const where = 'built into @' + fl.target + ', executed by ' + sink.how +
+                          ' on line ' + lineOf(sink.off);
+            if (fl.ident) {
+                add('SEC002', fl.off, '@' + fl.param.name,
+                    'CRITICAL: parameter @' + fl.param.name +
+                    ' is a caller supplied identifier or predicate - ' + where +
+                    '. Whitelist it or use QUOTENAME, sp_executesql cannot bind an object name');
+            } else if (fl.ctx === 'bare') {
+                add('SEC001', fl.off, '@' + fl.param.name,
+                    'CRITICAL: parameter @' + fl.param.name + ' (' + fl.param.type.toLowerCase() +
+                    ') is concatenated UNQUOTED - ' + where + '. Any SQL passed in runs as is');
+            } else {
+                add('SEC001', fl.off, '@' + fl.param.name,
+                    'HIGH: parameter @' + fl.param.name + ' (' + fl.param.type.toLowerCase() +
+                    ') is concatenated inside a quoted literal - ' + where +
+                    ". A single quote in the value breaks out. Bind it with sp_executesql");
+            }
+        });
+    });
+
+    /* ---- remote execution surface ---- */
+    const fourPart = /\[\s*'\s*\+\s*@(\w+)\s*\+\s*'\s*\]\s*\./g;
+    const seenRemote = new Set();
+    while ((m = fourPart.exec(noCmt)) !== null) {
+        const v = vars.get(m[1].toUpperCase());
+        const line = lineOf(m.index);
+        if (seenRemote.has(line)) continue;
+        seenRemote.add(line);
+        const src = v && v.tainted ? 'a PARAMETER - the remote target is caller controlled'
+                  : v && v.fromTable ? 'a config table, not caller controlled'
+                  : 'a variable - confirm where it is set';
+        add('SEC003', m.index, '@' + m[1],
+            (v && v.tainted ? 'CRITICAL' : 'REVIEW') +
+            ': dynamic SQL builds a linked server four part name from @' + m[1] +
+            ' and executes it. Server name comes from ' + src);
+    }
+
+    const atRe = /\bEXEC(?:UTE)?\s*\([\s\S]{0,4000}?\)\s*AT\s+([\w\[\]\.]+)/gi;
+    while ((m = atRe.exec(noCmt)) !== null) {
+        add('SEC003', m.index, m[1],
+            'REVIEW: pass through query executed on linked server ' + m[1] +
+            ' with EXEC ... AT - the text is run by the remote server, not parsed locally');
+    }
+
+    /* Only flag OPENQUERY/OPENROWSET/OPENDATASOURCE when the query text is
+       actually built by concatenation - a hardcoded literal query is not a
+       "dynamic query" risk and would just be noise. */
+    REMOTE_FUNCS.lastIndex = 0;
+    while ((m = REMOTE_FUNCS.exec(noCmt)) !== null) {
+        const head = noCmt.slice(m.index, m.index + 300);
+        if (!/'\s*\+|\+\s*@/.test(head)) continue;
+        add('SEC003', m.index, m[1].toUpperCase(),
+            'REVIEW: ' + m[1].toUpperCase() + ' runs a dynamically built query on the remote server' +
+            ' - check the tainted parameter finding above for this line');
+    }
+
+    if (/\bsp_addlinkedserver\b|\bsp_addlinkedsrvlogin\b/i.test(noCmt)) {
+        const mm = /\bsp_addlinkedserver\b|\bsp_addlinkedsrvlogin\b/i.exec(noCmt);
+        add('SEC003', mm.index, mm[0],
+            'REVIEW: script creates or configures a linked server login at runtime');
+    }
+
+    /* ---- credentials in plain text (value redacted) ---- */
+    SECRET_PATTERNS.forEach(p => {
+        p.re.lastIndex = 0;
+        let sm;
+        while ((sm = p.re.exec(noCmt)) !== null) {
+            const val = sm[sm.length - 1] || '';
+            if (/^N?''$/.test(val.trim())) continue;             /* empty */
+            const f = mkFinding('SEC004', lineOf(sm.index), p.what,
+                'CRITICAL: ' + p.what + ' is hard coded in the script. Move it to a credential ' +
+                'or integrated auth, then rotate the value - it is in source control history',
+                redactSecrets(snipAt(sql, sm.index)), null);
+            f.off = sm.index;
+            findings.push(f);
+        }
+    });
+
+    /* Connection-string idiom, checked one literal at a time so "user id" on
+       one line can never be paired with an unrelated "password" elsewhere. */
+    spans.strings.forEach(sp => {
+        const lit = sql.slice(sp[0], sp[1]);
+        if (lit.length > 4000) return;
+        CONN_STRING_RE.lastIndex = 0;
+        const cm = CONN_STRING_RE.exec(lit);
+        if (!cm) return;
+        const off = sp[0] + cm.index;
+        const f = mkFinding('SEC004', lineOf(off), 'connection string',
+            'CRITICAL: connection string with user id and password hard coded in the script. ' +
+            'Move it to a credential or integrated auth, then rotate the value - it is in source control history',
+            redactSecrets(snipAt(sql, off)), null);
+        f.off = off;
+        findings.push(f);
+    });
+}
+
+/* Never echo a secret back into the UI or the CSV. */
+function redactSecrets(line) {
+    return line
+        .replace(/\b(pass\s*word|pwd|passwd|secret)(\s*=\s*)(N?'[^']*'|[^\s;'")]+)/gi, '$1$2********')
+        .replace(/(@rmtpassword\s*=\s*)(N?'[^']*'|[^\s;'")]+)/gi, '$1********')
+        .replace(/\b(user\s*id|uid)(\s*=\s*)[^;'"]+/gi, '$1$2********');
+}
+
 /* -------------------------------- analyzer -------------------------------- */
 
 function analyze(sql) {
@@ -594,7 +1015,7 @@ function analyze(sql) {
     const refs = staticRefs.concat(dynRefs).sort((x, y) => x.s - y.s);
 
     const findings = [];
-    const stats = { sources: 0, covered: 0, missing: 0, dynamic: dynBlocks.length, procs: 0, nocount: 0 };
+    const stats = { sources: 0, covered: 0, missing: 0, dynamic: dynBlocks.length, procs: 0, nocount: 0, security: 0 };
 
     function add(rule, ref, msg, fix) {
         const f = mkFinding(rule, lineOf(ref.s), ref.disp + (ref.alias ? ' ' + ref.alias : ''),
@@ -632,6 +1053,9 @@ function analyze(sql) {
     const nc = analyzeNoCount(sql, codeDoc, lineOf, findings);
     stats.procs = nc.mods.length;
     stats.nocount = nc.missing;
+
+    analyzeSecurity(sql, codeDoc, spans, lineOf, findings);
+    stats.security = findings.filter(f => f.cat === 'security').length;
 
     findings.sort((a, b) => (a.line - b.line) || (a.off - b.off));
     return { findings: findings, stats: stats };
@@ -774,28 +1198,61 @@ function diffSql(leftText, rightText, opt) {
     return rows;
 }
 
-/* Word level highlight for a changed pair. */
-function inlineDiff(a, b) {
-    if (a.length > 4000 || b.length > 4000) return [escHtml(a), escHtml(b)];
+/* Word level highlight for a changed line pair, applied as CodeMirror
+   markText ranges (not HTML strings - there is no separate render surface
+   to build HTML for any more, the editor IS the display). */
+function markWordDiff(leftCm, li, rightCm, ri, a, b) {
+    if (a.length > 4000 || b.length > 4000) return;      /* pathological line - skip, stay responsive */
     const parts = Diff.diffWordsWithSpace(a, b);
-    let left = '', right = '';
+    let lch = 0, rch = 0;
     parts.forEach(p => {
-        const html = escHtml(p.value);
-        if (p.added) right += '<span class="chg">' + html + '</span>';
-        else if (p.removed) left += '<span class="chg">' + html + '</span>';
-        else { left += html; right += html; }
+        const len = p.value.length;
+        if (p.added) {
+            rightCm.markText({ line: ri, ch: rch }, { line: ri, ch: rch + len }, { className: 'chg-ins' });
+            rch += len;
+        } else if (p.removed) {
+            leftCm.markText({ line: li, ch: lch }, { line: li, ch: lch + len }, { className: 'chg-del' });
+            lch += len;
+        } else {
+            lch += len;
+            rch += len;
+        }
     });
-    return [left, right];
 }
 
 /* ----------------------------------- UI ----------------------------------- */
+
+/* CodeMirror's stock T-SQL mode (vendor/codemirror, MIT) already covers
+   keywords/strings/comments/numbers/@variables; the only tool-specific
+   addition is a thin overlay mode that re-tags NOLOCK & co with their own
+   style, since that is this tool's whole point. */
+CodeMirror.defineMode('sql-hints', function (config) {
+    const base = CodeMirror.getMode(config, 'text/x-mssql');
+    const hintRe = new RegExp('^(' + Array.from(HINT_WORDS).join('|') + ')\\b', 'i');
+    const overlay = {
+        token: function (stream) {
+            if (stream.match(hintRe)) return 'hint-nolock';
+            while (stream.next() != null && !stream.match(hintRe, false)) { /* advance to next candidate */ }
+            return null;
+        }
+    };
+    return CodeMirror.overlayMode(base, overlay);
+});
+CodeMirror.defineMIME('text/x-sql-hints', 'sql-hints');
+
+const CM_OPTIONS = {
+    mode: 'text/x-sql-hints',
+    lineNumbers: true,
+    tabSize: 4,
+    indentUnit: 4,
+    lineWrapping: false
+};
 
 document.addEventListener('DOMContentLoaded', () => {
     const $ = id => document.getElementById(id);
 
     /* audit */
-    const sqlInput = $('sqlInput');
-    const lineNumbers = $('lineNumbers');
+    let sqlCm = CodeMirror.fromTextArea($('sqlInput'), CM_OPTIONS);
     const resultsBody = $('resultsBody');
     const resultsTableContainer = $('resultsTableContainer');
     const emptyState = $('emptyState');
@@ -808,9 +1265,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const toast = $('toast');
 
     /* compare */
-    const leftInput = $('leftInput');
-    const rightInput = $('rightInput');
-    const diffContainer = $('diffContainer');
+    let leftCm = CodeMirror.fromTextArea($('leftInput'), CM_OPTIONS);
+    let rightCm = CodeMirror.fromTextArea($('rightInput'), CM_OPTIONS);
     const diffSummary = $('diffSummary');
 
     let current = null;
@@ -818,8 +1274,6 @@ document.addEventListener('DOMContentLoaded', () => {
     let sortKey = 'line';
     let sortDir = 1;
     let undoBuffer = null;
-    let issueLines = new Set();
-    let diffRows = null;
     let diffMarks = [];
     let markPos = -1;
 
@@ -833,7 +1287,11 @@ document.addEventListener('DOMContentLoaded', () => {
         $('compareActions').classList.toggle('hidden', audit);
         document.querySelectorAll('.mode').forEach(b =>
             b.classList.toggle('active', b.dataset.mode === mode));
-        (audit ? sqlInput : leftInput).focus();
+        /* the pane was hidden (display:none) while inactive, so CodeMirror's
+           cached measurements are stale until it is visible again */
+        (audit ? sqlCm : leftCm).refresh();
+        if (!audit) rightCm.refresh();
+        (audit ? sqlCm : leftCm).focus();
     }
 
     $('modeSwitch').addEventListener('click', e => {
@@ -869,21 +1327,188 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    /* ------------------------------ audit editor --------------------------- */
-
-    function updateLineNumbers() {
-        const count = sqlInput.value.split('\n').length;
-        const html = [];
-        for (let i = 1; i <= count; i++) {
-            html.push('<div' + (issueLines.has(i) ? ' class="issue"' : '') + '>' + i + '</div>');
-        }
-        lineNumbers.innerHTML = html.join('');
-        lineNumbers.scrollTop = sqlInput.scrollTop;
-        editorMeta.textContent = count + ' LINES / ' + sqlInput.value.length + ' CHARS';
+    /* A security finding carries its own CRITICAL/HIGH/REVIEW prefix in the
+       message; NOLOCK/NOCOUNT findings don't have a severity of their own.
+       Shared by the results table and the editor's line/gutter marking so
+       the two never disagree about what colour a finding gets. */
+    function findingStyle(f) {
+        const sev = f.cat === 'security' ? (/^(CRITICAL|HIGH|REVIEW)\b/.exec(f.msg) || [, 'REVIEW'])[1] : null;
+        const cls = sev ? sev.toLowerCase() : f.cat;
+        const accent = sev ? (sev === 'REVIEW' ? 'var(--purple)' : 'var(--red)')
+                     : f.cat === 'nolock' ? 'var(--amber)' : 'var(--blue)';
+        return { sev: sev, cls: cls, tagLabel: sev || (f.cat === 'nolock' ? 'NOLOCK' : 'NOCOUNT'), accent: accent };
     }
 
-    sqlInput.addEventListener('input', () => { issueLines = new Set(); updateLineNumbers(); });
-    sqlInput.addEventListener('scroll', () => { lineNumbers.scrollTop = sqlInput.scrollTop; });
+    /* ------------------------------ audit editor --------------------------- */
+
+    function clearIssueMarks() {
+        sqlCm.operation(() => {
+            for (let i = 0; i < sqlCm.lineCount(); i++) {
+                sqlCm.removeLineClass(i, 'background');
+                sqlCm.removeLineClass(i, 'gutter');
+            }
+        });
+    }
+
+    /* Paints every finding's line background + gutter cell. CodeMirror owns
+       its own rendering and scrolling, so - unlike the old hand-rolled
+       overlay - there is nothing here that can drift out of sync with what
+       is actually on screen: it is the same surface, not a second one. */
+    function markIssues() {
+        clearIssueMarks();
+        if (!current) return;
+        sqlCm.operation(() => {
+            current.findings.forEach(f => {
+                const style = findingStyle(f);
+                sqlCm.addLineClass(f.line - 1, 'background', 'cm-issue-' + style.cls);
+                sqlCm.addLineClass(f.line - 1, 'gutter', 'cm-gutter-' + style.cls);
+            });
+        });
+    }
+
+    function updateEditorMeta() {
+        editorMeta.textContent = sqlCm.lineCount() + ' LINES / ' + sqlCm.getValue().length + ' CHARS';
+    }
+
+    /* Editing after Run Analyze must drop the results table, not just the
+       line marks - a stale row's line number no longer matches the edited
+       text, so clicking it would select an unrelated line instead of what
+       was actually flagged. */
+    sqlCm.on('change', () => {
+        updateEditorMeta();
+        if (current) {
+            current = null;
+            clearIssueMarks();
+            resultsBody.innerHTML = '';
+            issueCountBadge.textContent = '0 Errors';
+            issueCountBadge.className = 'badge';
+            summaryText.textContent = 'Edited - Run Analyze again';
+            $('fixBtn').disabled = true;
+            $('exportBtn').disabled = true;
+            showState('empty');
+        }
+    });
+
+    /* -------------------------------- drag & drop --------------------------- */
+
+    /* Wire a drop zone: dragging a .sql/.txt file over `zoneEl` shows the dashed
+       overlay, dropping it loads the text via `setText`. Any other drag (text,
+       an image, a browser tab) is ignored so it does not swallow normal text
+       drag-select-and-drop inside the editor. */
+    function setupDropZone(zoneEl, setText, onLoaded) {
+        const overlay = zoneEl.querySelector('.drop-overlay');
+        let depth = 0;
+
+        function isFileDrag(e) {
+            return e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types || [], 'Files') >= 0;
+        }
+
+        zoneEl.addEventListener('dragenter', e => {
+            if (!isFileDrag(e)) return;
+            e.preventDefault();
+            depth++;
+            overlay.classList.remove('hidden');
+        });
+        zoneEl.addEventListener('dragover', e => {
+            if (!isFileDrag(e)) return;
+            e.preventDefault();
+        });
+        zoneEl.addEventListener('dragleave', () => {
+            depth = Math.max(0, depth - 1);
+            if (depth === 0) overlay.classList.add('hidden');
+        });
+        zoneEl.addEventListener('drop', e => {
+            if (!isFileDrag(e)) return;
+            e.preventDefault();
+            depth = 0;
+            overlay.classList.add('hidden');
+            const file = e.dataTransfer.files && e.dataTransfer.files[0];
+            if (!file) return;
+            if (file.size > 15 * 1024 * 1024) { flash('File too large (' + Math.round(file.size / 1048576) + ' MB).'); return; }
+            const reader = new FileReader();
+            reader.onload = () => {
+                setText(String(reader.result || '').replace(/^﻿/, ''));
+                flash('Loaded ' + file.name + '.');
+                if (onLoaded) onLoaded();
+            };
+            reader.onerror = () => flash('Could not read ' + file.name + '.');
+            reader.readAsText(file);
+        });
+    }
+
+    setupDropZone($('auditDrop'), text => sqlCm.setValue(text), run);
+    setupDropZone($('leftDrop'), text => leftCm.setValue(text), refreshCompare);
+    setupDropZone($('rightDrop'), text => rightCm.setValue(text), refreshCompare);
+
+    /* -------------------------------- resizing ------------------------------
+       Drag the divider to resize the two panes in either view. The left
+       track gets an explicit pixel width via a CSS custom property; the
+       right track stays 1fr and just takes whatever is left, so the divider
+       never has to know the container's total width up front. CodeMirror
+       caches its own layout measurements, so anything it is displaying needs
+       an explicit refresh() after the container's width actually changes. */
+    function makeResizable(container, resizer, varName, storageKey, onResize) {
+        const MIN = 200;
+
+        function apply(px) {
+            const max = Math.max(MIN, container.clientWidth - MIN - resizer.offsetWidth);
+            px = Math.max(MIN, Math.min(px, max));
+            container.style.setProperty(varName, px + 'px');
+            if (onResize) onResize();
+            return px;
+        }
+
+        function currentPx() {
+            const stored = parseFloat(getComputedStyle(container).getPropertyValue(varName));
+            return stored || container.clientWidth / 2;
+        }
+
+        function persist(px) {
+            if (!storageKey) return;
+            try { localStorage.setItem(storageKey, px); } catch (e) { /* private mode / quota - fine to skip */ }
+        }
+
+        if (storageKey) {
+            let saved = null;
+            try { saved = localStorage.getItem(storageKey); } catch (e) { /* ignore */ }
+            if (saved) apply(parseFloat(saved));
+        }
+
+        let dragging = false;
+        resizer.addEventListener('mousedown', e => {
+            dragging = true;
+            resizer.classList.add('dragging');
+            document.body.style.cursor = 'col-resize';
+            document.body.style.userSelect = 'none';
+            e.preventDefault();
+        });
+        window.addEventListener('mousemove', e => {
+            if (!dragging) return;
+            persist(apply(e.clientX - container.getBoundingClientRect().left));
+        });
+        window.addEventListener('mouseup', () => {
+            if (!dragging) return;
+            dragging = false;
+            resizer.classList.remove('dragging');
+            document.body.style.cursor = '';
+            document.body.style.userSelect = '';
+        });
+
+        resizer.addEventListener('keydown', e => {
+            if (e.key === 'ArrowLeft') { persist(apply(currentPx() - 20)); e.preventDefault(); }
+            else if (e.key === 'ArrowRight') { persist(apply(currentPx() + 20)); e.preventDefault(); }
+        });
+        resizer.addEventListener('dblclick', () => {
+            container.style.removeProperty(varName);
+            if (onResize) onResize();
+            if (storageKey) { try { localStorage.removeItem(storageKey); } catch (e) { /* ignore */ } }
+        });
+    }
+
+    makeResizable(document.querySelector('.side-by-side'), $('auditResizer'), '--audit-split', 'sqltools-audit-split',
+        () => sqlCm.refresh());
+    makeResizable(document.querySelector('.compare-inputs'), $('cmpResizer'), '--cmp-split', 'sqltools-cmp-split',
+        () => { leftCm.refresh(); rightCm.refresh(); });
 
     function showState(state) {
         emptyState.classList.add('hidden');
@@ -897,23 +1522,24 @@ document.addEventListener('DOMContentLoaded', () => {
     /* --------------------------------- audit ------------------------------- */
 
     function run() {
-        const sql = sqlInput.value;
+        const sql = sqlCm.getValue();
         if (!sql.trim()) { flash('Nothing to analyze.'); return; }
 
         current = analyze(sql);
-        issueLines = new Set(current.findings.map(f => f.line));
-        updateLineNumbers();
-        filterBar.classList.remove('hidden');
+        markIssues();
 
+        const security = current.findings.filter(f => f.cat === 'security').length;
         const nolock = current.findings.filter(f => f.cat === 'nolock').length;
         const nocount = current.findings.filter(f => f.cat === 'nocount').length;
-        const total = nolock + nocount;
+        const total = security + nolock + nocount;
 
         issueCountBadge.textContent = total
-            ? total + ' ERROR' + (total === 1 ? '' : 'S') + ' · ' + nolock + ' NOLOCK / ' + nocount + ' NOCOUNT'
+            ? total + ' ERROR' + (total === 1 ? '' : 'S') +
+              (security ? ' · ' + security + ' SECURITY' : '') +
+              ' · ' + nolock + ' NOLOCK / ' + nocount + ' NOCOUNT'
             : '0 Errors';
-        issueCountBadge.className = total ? 'badge' : 'badge success';
-        summaryText.textContent = total ? 'Errors Found' : 'All Clear';
+        issueCountBadge.className = total ? (security ? 'badge danger' : 'badge') : 'badge success';
+        summaryText.textContent = security ? 'Security Risk Found' : total ? 'Errors Found' : 'All Clear';
 
         $('fixBtn').disabled = !current.findings.some(f => f.fix);
         $('exportBtn').disabled = !current.findings.length;
@@ -952,29 +1578,27 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
         showState('results');
-        resultsBody.innerHTML = rows.map(f =>
-            '<tr data-line="' + f.line + '">' +
-            '<td class="line-cell">' + f.line + '</td>' +
-            '<td><span class="tag tag-' + f.cat + '">' + (f.cat === 'nolock' ? 'NOLOCK' : 'NOCOUNT') + '</span>' +
-            (f.dynamic ? '<span class="tag tag-dyn">DYN</span>' : '') +
-            (f.fix ? '<span class="fixable" title="auto fixable">&#9670;</span>' : '') + '</td>' +
-            '<td class="obj-cell"><b>' + escHtml(f.obj) + '</b></td>' +
-            '<td class="issue-cell">' + escHtml(f.msg) + '</td>' +
-            '<td class="snippet-cell">' + escHtml(f.ctx) + '</td>' +
-            '</tr>').join('');
+        resultsBody.innerHTML = rows.map(f => {
+            const style = findingStyle(f);
+            return '<tr data-line="' + f.line + '"' + (style.sev ? ' class="sev-' + style.cls + '"' : '') +
+                ' style="--row-accent:' + style.accent + '">' +
+                '<td class="line-cell">' + f.line + '</td>' +
+                '<td><span class="tag tag-' + style.cls + '">' + style.tagLabel + '</span>' +
+                (f.dynamic ? '<span class="tag tag-dyn">DYN</span>' : '') +
+                (f.fix ? '<span class="fixable" title="auto fixable">&#9670;</span>' : '') + '</td>' +
+                '<td class="obj-cell"><b>' + escHtml(f.obj) + '</b></td>' +
+                '<td class="issue-cell">' + escHtml(f.msg) + '</td>' +
+                '<td class="snippet-cell">' + escHtml(f.ctx) + '</td>' +
+                '</tr>';
+        }).join('');
     }
 
     function jumpToLine(num) {
-        const lines = sqlInput.value.split('\n');
-        if (num < 1 || num > lines.length) return;
-        sqlInput.focus();
-        let startPos = 0;
-        for (let i = 0; i < num - 1; i++) startPos += lines[i].length + 1;
-        setTimeout(() => {
-            sqlInput.setSelectionRange(startPos, startPos + lines[num - 1].length);
-            sqlInput.scrollTop = Math.max(0, (num - 1) * 22.4 - sqlInput.clientHeight / 3);
-            lineNumbers.scrollTop = sqlInput.scrollTop;
-        }, 0);
+        if (num < 1 || num > sqlCm.lineCount()) return;
+        const lineLen = sqlCm.getLine(num - 1).length;
+        sqlCm.setSelection({ line: num - 1, ch: 0 }, { line: num - 1, ch: lineLen });
+        sqlCm.scrollIntoView({ line: num - 1, ch: 0 }, 120);
+        sqlCm.focus();
     }
 
     resultsBody.addEventListener('click', e => {
@@ -1006,42 +1630,40 @@ document.addEventListener('DOMContentLoaded', () => {
     $('analyzeBtn').addEventListener('click', run);
 
     $('clearBtn').addEventListener('click', () => {
-        sqlInput.value = '';
+        sqlCm.setValue('');
         current = null;
         undoBuffer = null;
-        issueLines = new Set();
-        updateLineNumbers();
-        filterBar.classList.add('hidden');
+        clearIssueMarks();
         resultsBody.innerHTML = '';
         issueCountBadge.textContent = '0 Errors';
         issueCountBadge.className = 'badge';
         summaryText.textContent = 'Ready to Analyze';
         $('fixBtn').disabled = true;
         $('exportBtn').disabled = true;
-        $('undoBtn').classList.add('hidden');
+        $('undoBtn').disabled = true;
         showState('empty');
     });
 
     $('fixBtn').addEventListener('click', () => {
         if (!current) return;
-        undoBuffer = sqlInput.value;
-        const res = applyFixes(sqlInput.value, current.findings);
-        sqlInput.value = res.sql;
-        $('undoBtn').classList.remove('hidden');
+        undoBuffer = sqlCm.getValue();
+        const res = applyFixes(undoBuffer, current.findings);
+        sqlCm.setValue(res.sql);
+        $('undoBtn').disabled = false;
         run();
         flash('Applied ' + res.count + ' fix' + (res.count === 1 ? '' : 'es') + '. Review before deploying.');
     });
 
     $('undoBtn').addEventListener('click', () => {
         if (undoBuffer === null) return;
-        sqlInput.value = undoBuffer;
+        sqlCm.setValue(undoBuffer);
         undoBuffer = null;
-        $('undoBtn').classList.add('hidden');
+        $('undoBtn').disabled = true;
         run();
         flash('Auto fix reverted.');
     });
 
-    $('copyBtn').addEventListener('click', () => copyText(sqlInput.value, 'SQL copied.'));
+    $('copyBtn').addEventListener('click', () => copyText(sqlCm.getValue(), 'SQL copied.'));
 
     $('exportBtn').addEventListener('click', () => {
         if (!current || !current.findings.length) return;
@@ -1059,146 +1681,190 @@ document.addEventListener('DOMContentLoaded', () => {
         flash('Exported ' + rows.length + ' rows.');
     });
 
-    /* -------------------------------- compare ------------------------------ */
+    /* -------------------------------- compare ------------------------------
+       One live pane per side: the editor IS the diff output, not a separate
+       result view below it. Every real line of each side gets its own
+       CodeMirror line/gutter class per its diff role, and changed-line pairs
+       additionally get word-level markText spans - paste, type, or drop a
+       file and the colouring updates as you go, with no explicit Compare
+       step. Cross-pane row alignment after an insertion or deletion is only
+       approximate by design: nothing pads one side to match the other, since
+       that would mean showing lines that don't actually exist in the pasted
+       text. Each pane's own line numbers (CodeMirror's real gutter now, not
+       a hand-built one) stay exact regardless. ------------------------- */
 
     function cmpOpts() {
         return {
             ignoreCase: $('optCase').checked,
             ignoreWhitespace: $('optWs').checked,
-            ignoreComments: $('optCmt').checked,
-            diffsOnly: $('optOnly').checked
+            ignoreComments: $('optCmt').checked
         };
     }
 
-    function updateCmpMeta() {
-        $('leftMeta').textContent = leftInput.value.split('\n').length + ' LINES';
-        $('rightMeta').textContent = rightInput.value.split('\n').length + ' LINES';
+    function clearCompareMarks() {
+        [leftCm, rightCm].forEach(cm => {
+            cm.operation(() => {
+                for (let i = 0; i < cm.lineCount(); i++) {
+                    cm.removeLineClass(i, 'background');
+                    cm.removeLineClass(i, 'gutter');
+                    cm.removeLineClass(i, 'wrap');
+                }
+            });
+            cm.getAllMarks().forEach(m => m.clear());
+        });
     }
 
-    leftInput.addEventListener('input', updateCmpMeta);
-    rightInput.addEventListener('input', updateCmpMeta);
+    /* Walks jsdiff's row list once, applying line/gutter classes and word
+       level marks directly via the CodeMirror API - no HTML is built at all.
+       Returns the list of changed-row positions for the Prev/Next nav. */
+    function applyCompareMarks(rows) {
+        clearCompareMarks();
+        const marks = [];
+        let li = 0, ri = 0;
+        leftCm.operation(() => {
+            rightCm.operation(() => {
+                rows.forEach(r => {
+                    if (r.t === 'same') { li++; ri++; return; }
+                    if (r.t === 'del') {
+                        leftCm.addLineClass(li, 'background', 'hl-del');
+                        leftCm.addLineClass(li, 'gutter', 'cm-gutter-del');
+                        marks.push({ lline: li, rline: null });
+                        li++;
+                    } else if (r.t === 'ins') {
+                        rightCm.addLineClass(ri, 'background', 'hl-ins');
+                        rightCm.addLineClass(ri, 'gutter', 'cm-gutter-ins');
+                        marks.push({ lline: null, rline: ri });
+                        ri++;
+                    } else {
+                        leftCm.addLineClass(li, 'background', 'hl-mod-del');
+                        leftCm.addLineClass(li, 'gutter', 'cm-gutter-del');
+                        rightCm.addLineClass(ri, 'background', 'hl-mod-ins');
+                        rightCm.addLineClass(ri, 'gutter', 'cm-gutter-ins');
+                        markWordDiff(leftCm, li, rightCm, ri, r.left, r.right);
+                        marks.push({ lline: li, rline: ri });
+                        li++;
+                        ri++;
+                    }
+                });
+            });
+        });
+        return marks;
+    }
 
-    function compare() {
-        if (!leftInput.value.trim() && !rightInput.value.trim()) {
-            flash('Paste SQL into both panes first.');
+    let compareTimer = null;
+
+    function refreshCompare() {
+        clearTimeout(compareTimer);
+        const leftText = leftCm.getValue(), rightText = rightCm.getValue();
+        $('leftMeta').textContent = leftCm.lineCount() + ' LINES';
+        $('rightMeta').textContent = rightCm.lineCount() + ' LINES';
+
+        if (!leftText.trim() && !rightText.trim()) {
+            clearCompareMarks();
+            diffSummary.textContent = 'Paste SQL into both panes';
+            diffSummary.className = 'diff-summary';
+            diffMarks = [];
+            markPos = -1;
+            $('prevDiffBtn').disabled = true;
+            $('nextDiffBtn').disabled = true;
             return;
         }
-        const opt = cmpOpts();
-        diffRows = diffSql(leftInput.value, rightInput.value, opt);
-        renderDiff(opt);
-    }
 
-    /* keep 2 lines of context around every change when hiding identical lines */
-    function isNear(rows, i) {
-        for (let k = Math.max(0, i - 2); k <= Math.min(rows.length - 1, i + 2); k++) {
-            if (rows[k].t !== 'same') return true;
-        }
-        return false;
-    }
+        const rows = diffSql(leftText, rightText, cmpOpts());
+        diffMarks = applyCompareMarks(rows);
+        markPos = -1;
+        $('prevDiffBtn').disabled = !diffMarks.length;
+        $('nextDiffBtn').disabled = !diffMarks.length;
 
-    function renderDiff(opt) {
-        const rows = diffRows;
         const counts = { ins: 0, del: 0, mod: 0 };
         rows.forEach(r => { if (r.t !== 'same') counts[r.t]++; });
         const total = counts.ins + counts.del + counts.mod;
-
         diffSummary.textContent = total
             ? total + ' difference' + (total === 1 ? '' : 's') + ' · ' +
               counts.mod + ' changed / ' + counts.ins + ' added / ' + counts.del + ' removed'
             : 'Both sides are identical';
         diffSummary.className = 'diff-summary' + (total ? '' : ' identical');
-
-        const html = [];
-        let skipped = 0;
-        let diffIndex = 0;
-
-        function spacer() {
-            if (!skipped) return;
-            html.push('<tr class="d-skip"><td colspan="6">' + skipped +
-                      ' identical line' + (skipped === 1 ? '' : 's') + ' hidden</td></tr>');
-            skipped = 0;
-        }
-
-        rows.forEach((r, i) => {
-            if (r.t === 'same') {
-                if (opt.diffsOnly && !isNear(rows, i)) { skipped++; return; }
-                spacer();
-                html.push('<tr class="d-same">' +
-                    '<td class="dl">' + r.ln + '</td><td class="dm"></td><td class="dt">' + escHtml(r.left) + '</td>' +
-                    '<td class="dl">' + r.rn + '</td><td class="dm"></td><td class="dt">' + escHtml(r.right) + '</td></tr>');
-                return;
-            }
-            spacer();
-            let lh = escHtml(r.left), rh = escHtml(r.right);
-            if (r.t === 'mod') { const pair = inlineDiff(r.left, r.right); lh = pair[0]; rh = pair[1]; }
-            const lMark = r.t === 'ins' ? '' : r.t === 'mod' ? '~' : '-';
-            const rMark = r.t === 'del' ? '' : r.t === 'mod' ? '~' : '+';
-            html.push('<tr class="d-' + r.t + '" data-diff="' + (diffIndex++) + '">' +
-                '<td class="dl">' + (r.ln || '') + '</td><td class="dm">' + lMark + '</td>' +
-                '<td class="dt">' + lh + '</td>' +
-                '<td class="dl">' + (r.rn || '') + '</td><td class="dm">' + rMark + '</td>' +
-                '<td class="dt">' + rh + '</td></tr>');
-        });
-        spacer();
-
-        diffContainer.innerHTML =
-            '<table class="diff-table"><colgroup><col class="c-ln"><col class="c-mk"><col>' +
-            '<col class="c-ln"><col class="c-mk"><col></colgroup>' +
-            '<thead><tr><th colspan="3">Original</th><th colspan="3">Modified</th></tr></thead>' +
-            '<tbody>' + html.join('') + '</tbody></table>';
-
-        diffMarks = Array.prototype.slice.call(diffContainer.querySelectorAll('[data-diff]'));
-        markPos = -1;
-        $('prevDiffBtn').disabled = !diffMarks.length;
-        $('nextDiffBtn').disabled = !diffMarks.length;
     }
 
+    function scheduleCompareRefresh() {
+        clearTimeout(compareTimer);
+        compareTimer = setTimeout(refreshCompare, 150);
+    }
+
+    leftCm.on('change', scheduleCompareRefresh);
+    rightCm.on('change', scheduleCompareRefresh);
+
+    /* Scroll one pane, the other follows - by fraction, so it still lines up
+       when the two files have a different number of lines. A guard flag
+       stops the mirrored scroll event from bouncing back and forth forever.
+       Nothing else needs syncing: CodeMirror is the only rendering surface
+       for each pane, so there is nothing left that could drift apart from
+       it. */
+    let syncingScroll = false;
+    function linkScroll(a, b) {
+        a.on('scroll', () => {
+            if (syncingScroll) return;
+            syncingScroll = true;
+            const infoA = a.getScrollInfo(), infoB = b.getScrollInfo();
+            const rangeA = infoA.height - infoA.clientHeight;
+            const rangeB = infoB.height - infoB.clientHeight;
+            b.scrollTo(infoA.left, rangeA > 0 ? (infoA.top / rangeA) * rangeB : 0);
+            syncingScroll = false;
+        });
+    }
+    linkScroll(leftCm, rightCm);
+    linkScroll(rightCm, leftCm);
+
+    function clearFocusedLines() {
+        [leftCm, rightCm].forEach(cm => {
+            for (let i = 0; i < cm.lineCount(); i++) cm.removeLineClass(i, 'wrap', 'cm-focused-line');
+        });
+    }
+
+    /* Both sides' exact line are known for every mark, so - unlike ordinary
+       free scrolling, which only has each side's fraction-of-total-height to
+       go on - navigating to a specific difference can position each pane
+       precisely instead of leaving the other to its usual approximation. */
     function gotoMark(step) {
         if (!diffMarks.length) return;
         markPos = (markPos + step + diffMarks.length) % diffMarks.length;
-        diffMarks.forEach(el => el.classList.remove('focused'));
-        const el = diffMarks[markPos];
-        el.classList.add('focused');
-        el.scrollIntoView({ block: 'center' });
+        clearFocusedLines();
+        const mark = diffMarks[markPos];
+        if (mark.lline != null) {
+            leftCm.addLineClass(mark.lline, 'wrap', 'cm-focused-line');
+            leftCm.scrollIntoView({ line: mark.lline, ch: 0 }, 100);
+        }
+        if (mark.rline != null) {
+            rightCm.addLineClass(mark.rline, 'wrap', 'cm-focused-line');
+            rightCm.scrollIntoView({ line: mark.rline, ch: 0 }, 100);
+        }
     }
 
-    $('compareBtn').addEventListener('click', compare);
     $('nextDiffBtn').addEventListener('click', () => gotoMark(1));
     $('prevDiffBtn').addEventListener('click', () => gotoMark(-1));
 
     $('swapBtn').addEventListener('click', () => {
-        const t = leftInput.value;
-        leftInput.value = rightInput.value;
-        rightInput.value = t;
-        updateCmpMeta();
-        if (diffRows) compare();
+        const t = leftCm.getValue();
+        leftCm.setValue(rightCm.getValue());
+        rightCm.setValue(t);
+        refreshCompare();
     });
 
     $('clearCmpBtn').addEventListener('click', () => {
-        leftInput.value = '';
-        rightInput.value = '';
-        diffRows = null;
-        diffMarks = [];
-        updateCmpMeta();
-        diffSummary.textContent = 'Not compared';
-        diffSummary.className = 'diff-summary';
-        $('prevDiffBtn').disabled = true;
-        $('nextDiffBtn').disabled = true;
-        diffContainer.innerHTML =
-            '<div class="empty-state"><h3>Nothing Compared Yet</h3>' +
-            '<p>Paste SQL into both panes and click Compare.</p></div>';
+        leftCm.setValue('');
+        rightCm.setValue('');
+        refreshCompare();
     });
 
-    ['optCase', 'optWs', 'optCmt', 'optOnly'].forEach(id =>
-        $(id).addEventListener('change', () => { if (diffRows) compare(); }));
+    ['optCase', 'optWs', 'optCmt'].forEach(id => $(id).addEventListener('change', refreshCompare));
 
     document.addEventListener('keydown', e => {
         if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
             e.preventDefault();
-            if (activeMode() === 'audit') run(); else compare();
+            if (activeMode() === 'audit') run(); else refreshCompare();
         }
     });
 
-    updateLineNumbers();
-    updateCmpMeta();
+    updateEditorMeta();
+    refreshCompare();
 });

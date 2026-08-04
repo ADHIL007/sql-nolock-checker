@@ -8,6 +8,23 @@
     --accent: #212529;
     --danger: #000000;
     --highlight: rgba(0, 0, 0, 0.05);
+
+    /* Semantic colour palette - the only place colour carries meaning:
+       red = removed / critical, green = added / clear, amber = NOLOCK,
+       blue = NOCOUNT / informational, purple = review. Everything else
+       in the app stays the original monochrome. */
+    --red: #c92a2a;
+    --red-bg: #fdecec;
+    --red-strong: #f3a2a2;
+    --green: #157347;
+    --green-bg: #e8f6ee;
+    --green-strong: #9fdcb9;
+    --amber: #b5590c;
+    --amber-bg: #fdf1e2;
+    --blue: #1c5fc9;
+    --blue-bg: #eaf1fd;
+    --purple: #7548c4;
+    --purple-bg: #f2edfb;
 }
 
 * {
@@ -30,62 +47,82 @@ body {
     height: 100vh;
 }
 
+/* Fixed height and no wrapping: the header must never change size when the
+   mode switches or when a button appears, otherwise the whole page shifts. */
 header {
     background: #ffffff;
-    padding: 0.75rem 1.5rem;
+    padding: 0 1.5rem;
+    height: 56px;
+    flex: 0 0 56px;
     border-bottom: 2px solid var(--text-primary);
     display: flex;
     justify-content: space-between;
     align-items: center;
     gap: 1rem;
-    flex-wrap: wrap;
-}
-
-.brand-text h1 {
-    font-size: 1.1rem;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-}
-
-.brand-text p {
-    font-size: 0.7rem;
-    color: var(--text-secondary);
+    flex-wrap: nowrap;
+    overflow: hidden;
 }
 
 .actions {
     display: flex;
     gap: 0.4rem;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     justify-content: flex-end;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-bottom: 1px;
+}
+
+.actions button {
+    white-space: nowrap;
+    flex: 0 0 auto;
 }
 
 .side-by-side {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: var(--audit-split, 1fr) 6px 1fr;
     flex: 1;
     overflow: hidden;
+    min-height: 0;
+}
+
+/* Stable panel chrome: fixed heights stop the results area from shifting
+   when a header label or a badge changes length. */
+.panel-header {
+    height: 26px;
+    flex: 0 0 26px;
+    align-items: center;
+}
+
+.filter-bar {
+    height: 30px;
+    flex: 0 0 30px;
 }
 
 section {
     display: flex;
     flex-direction: column;
     overflow: hidden;
-}
-
-.editor-section {
-    border-right: 1px solid var(--border-color);
+    min-height: 0;
 }
 
 .panel-header {
     background: var(--bg-side);
-    padding: 0.4rem 1rem;
+    padding: 0 1rem;
     font-size: 0.7rem;
     font-weight: 700;
     color: var(--text-secondary);
     border-bottom: 1px solid var(--border-color);
     display: flex;
     justify-content: space-between;
+    gap: 0.5rem;
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+.panel-header > span:first-child {
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .editor-wrapper {
@@ -93,40 +130,94 @@ section {
     flex: 1;
     overflow: hidden;
     background: #ffffff;
+    position: relative;
 }
 
-.line-numbers {
-    width: 42px;
-    padding: 1rem 0;
-    background: #f1f3f5;
-    color: #868e96;
-    text-align: center;
-    font-family: 'Courier New', Courier, monospace;
-    font-size: 0.8rem;
-    line-height: 1.4rem;
-    user-select: none;
-    border-right: 1px solid var(--border-color);
+.cmp-pane {
+    position: relative;
 }
 
-textarea {
-    flex: 1;
-    background: transparent;
-    border: none;
+/* Drag and drop - shown by JS while a file is dragged over the pane */
+.drop-overlay {
+    position: absolute;
+    inset: 0;
+    top: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(255, 255, 255, 0.92);
+    border: 2px dashed var(--text-primary);
+    z-index: 20;
+    pointer-events: none;
+}
+
+.drop-overlay span {
+    font-size: 0.85rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
     color: var(--text-primary);
-    padding: 1rem;
+}
+
+/* ==========================================================================
+   Editor - CodeMirror 5 (vendor/codemirror, MIT). Replaced a hand-rolled
+   "invisible textarea over a colour-coded <pre>" trick that had a real,
+   recurring class of bug: the overlay and the real textarea could drift out
+   of scroll sync (nothing forced them back together), so what you saw did
+   not always match what you were actually editing. CodeMirror owns its own
+   rendering, gutter, and scrolling - there is only one surface now, so this
+   entire failure mode is gone structurally, not patched around.
+   ========================================================================== */
+
+.editor-wrapper .CodeMirror {
+    flex: 1;
+    height: 100%;
     font-family: 'Courier New', Courier, monospace;
     font-size: 0.85rem;
     line-height: 1.4rem;
-    resize: none;
-    outline: none;
-    white-space: pre;
-    overflow: auto;
 }
+
+.CodeMirror-gutters {
+    background: #f1f3f5;
+    border-right: 1px solid var(--border-color);
+}
+
+.CodeMirror-linenumber {
+    color: #868e96;
+    font-size: 0.8rem;
+}
+
+/* Token colours - matches the classic SSMS/VS Code T-SQL palette so this
+   reads instantly to anyone who already lives in SQL Server tooling. */
+.cm-keyword  { color: #0451a5; font-weight: 600; }
+.cm-atom,
+.cm-type     { color: #0451a5; }
+.cm-string   { color: var(--red); }
+.cm-comment  { color: var(--green); font-style: italic; }
+.cm-number   { color: #098658; }
+.cm-variable-2 { color: #267f99; }               /* @vars */
+.cm-builtin  { color: #795e26; }                 /* client-side commands */
+.cm-hint-nolock { color: var(--amber); font-weight: 700; }  /* NOLOCK & co - the whole point of this tool */
+
+/* Audit: whole-line tint for a flagged line, applied via addLineClass. */
+.cm-issue-nolock  { background: var(--amber-bg); box-shadow: inset 3px 0 0 var(--amber); }
+.cm-issue-nocount { background: var(--blue-bg); box-shadow: inset 3px 0 0 var(--blue); }
+.cm-issue-high,
+.cm-issue-critical { background: var(--red-bg); box-shadow: inset 3px 0 0 var(--red); }
+.cm-issue-review  { background: var(--purple-bg); box-shadow: inset 3px 0 0 var(--purple); }
+
+.cm-gutter-nolock  { background: var(--amber-bg) !important; color: var(--amber) !important; font-weight: 700; }
+.cm-gutter-nocount { background: var(--blue-bg) !important; color: var(--blue) !important; font-weight: 700; }
+.cm-gutter-high,
+.cm-gutter-critical { background: var(--red-bg) !important; color: var(--red) !important; font-weight: 700; }
+.cm-gutter-review  { background: var(--purple-bg) !important; color: var(--purple) !important; font-weight: 700; }
 
 /* Table Design */
 .table-container {
     flex: 1;
     overflow: auto;
+    min-height: 0;
+    scrollbar-gutter: stable;      /* no width shift when the scrollbar appears */
 }
 
 table {
@@ -173,7 +264,7 @@ tr:nth-child(even) {
 
 .badge {
     padding: 2px 6px;
-    background: #343a40;
+    background: var(--amber);
     color: #fff;
     border-radius: 2px;
     font-size: 0.65rem;
@@ -181,7 +272,13 @@ tr:nth-child(even) {
 }
 
 .badge.success {
-    background: #adb5bd;
+    background: var(--green);
+}
+
+.badge.danger {
+    background: var(--red);
+    outline: 2px solid var(--red-strong);
+    outline-offset: 1px;
 }
 
 /* Buttons - Plain Monochromatic */
@@ -415,25 +512,46 @@ td {
     color: var(--text-secondary);
 }
 
-/* Type tags - monochrome, fill separates NOLOCK from NOCOUNT */
+/* Type / severity tags - amber = NOLOCK, blue = NOCOUNT, red = security
+   critical/high, purple = security review-only (not confirmed exploitable). */
 .tag {
     display: inline-block;
     padding: 1px 5px;
     font-size: 0.58rem;
     font-weight: 700;
     letter-spacing: 0.5px;
-    border: 1px solid var(--text-primary);
+    border: 1px solid transparent;
     white-space: nowrap;
 }
 
 .tag-nolock {
-    background: var(--text-primary);
-    color: #fff;
+    background: var(--amber-bg);
+    color: var(--amber);
+    border-color: var(--amber);
 }
 
 .tag-nocount {
-    background: #fff;
-    color: var(--text-primary);
+    background: var(--blue-bg);
+    color: var(--blue);
+    border-color: var(--blue);
+}
+
+.tag-critical {
+    background: var(--red);
+    color: #fff;
+    border-color: var(--red);
+}
+
+.tag-high {
+    background: var(--red-bg);
+    color: var(--red);
+    border-color: var(--red);
+}
+
+.tag-review {
+    background: var(--purple-bg);
+    color: var(--purple);
+    border-color: var(--purple);
 }
 
 .tag-dyn {
@@ -444,6 +562,18 @@ td {
     border-style: dashed;
 }
 
+/* A thin colour bar down the left of the row - same family as its tag -
+   so severity registers before you even read the text. */
+#resultsBody tr td.line-cell {
+    box-shadow: inset 3px 0 0 var(--row-accent, transparent);
+}
+
+tr.sev-critical .issue-cell,
+tr.sev-high .issue-cell {
+    color: var(--red);
+    font-weight: 700;
+}
+
 .legend-note {
     margin-top: 0.7rem;
     padding-top: 0.5rem;
@@ -451,13 +581,6 @@ td {
     font-size: 0.68rem;
     line-height: 1.45;
     color: var(--text-muted);
-}
-
-/* Issue markers in the gutter */
-.line-numbers .issue {
-    font-weight: 700;
-    color: #000;
-    background: #dee2e6;
 }
 
 /* Rule legend */
@@ -518,45 +641,68 @@ td {
 
 .compare-view {
     display: grid;
-    grid-template-rows: minmax(120px, 30%) auto 1fr;
+    grid-template-rows: 34px minmax(0, 1fr);
     flex: 1;
     overflow: hidden;
+    min-height: 0;
 }
 
 .compare-inputs {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: var(--cmp-split, 1fr) 6px 1fr;
     overflow: hidden;
-    border-bottom: 1px solid var(--border-color);
+    min-height: 0;
+}
+
+/* Draggable divider between the two panes in both views. */
+.resizer {
+    position: relative;
+    background: var(--border-color);
+    cursor: col-resize;
+    touch-action: none;
+}
+
+.resizer:hover,
+.resizer.dragging {
+    background: var(--text-primary);
+}
+
+.resizer:focus-visible {
+    outline: 2px solid var(--blue);
+    outline-offset: -1px;
+}
+
+/* Widen the actual grab target past the visible 6px line without widening
+   the line itself, so it's easy to grab without looking oversized. */
+.resizer::before {
+    content: '';
+    position: absolute;
+    inset: 0 -4px;
 }
 
 .cmp-pane {
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    border-right: 1px solid var(--border-color);
-}
-
-.cmp-pane:last-child {
-    border-right: none;
-}
-
-.cmp-pane textarea {
-    padding: 0.6rem 0.8rem;
-    background: #fff;
+    background: #ffffff;      /* same opaque backdrop as the audit editor */
 }
 
 .cmp-toolbar {
     display: flex;
     align-items: center;
     gap: 0.9rem;
-    padding: 0.4rem 0.8rem;
+    padding: 0 0.8rem;
+    height: 34px;
     background: var(--bg-side);
     border-bottom: 1px solid var(--border-color);
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
 }
 
 .opt {
+    flex: 0 0 auto;
+    white-space: nowrap;
     font-size: 0.66rem;
     text-transform: uppercase;
     letter-spacing: 0.4px;
@@ -582,13 +728,13 @@ td {
     font-weight: 700;
     letter-spacing: 0.4px;
     padding: 2px 6px;
-    background: var(--text-primary);
+    background: var(--blue);
     color: #fff;
     white-space: nowrap;
 }
 
 .diff-summary.identical {
-    background: #adb5bd;
+    background: var(--green);
 }
 
 .nav-btn {
@@ -597,125 +743,51 @@ td {
     line-height: 1;
 }
 
-.diff-container {
-    overflow: auto;
-    background: #fff;
+/* Live diff overlay - applied per real line via CodeMirror's addLineClass,
+   tinted by its diff role. Same surface the user types into, not a separate
+   result view: paste or edit, the colouring updates in place. */
+.hl-del,
+.hl-mod-del {
+    background: var(--red-bg);
+    box-shadow: inset 3px 0 0 var(--red);
 }
 
-.diff-container .empty-state {
-    min-height: 100%;
+.hl-ins,
+.hl-mod-ins {
+    background: var(--green-bg);
+    box-shadow: inset 3px 0 0 var(--green);
 }
 
-.diff-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-family: 'Courier New', Courier, monospace;
-    font-size: 0.76rem;
-    table-layout: fixed;
+/* Inline word-level change - a stronger fill of the same red/green inside the
+   lighter line tint, so the exact edit jumps out immediately. Applied via
+   CodeMirror's markText, same class names as before. */
+.chg-del {
+    background: var(--red-strong);
+    font-weight: 600;
 }
 
-.diff-table col.c-ln {
-    width: 44px;
+.chg-ins {
+    background: var(--green-strong);
+    font-weight: 600;
 }
 
-.diff-table col.c-mk {
-    width: 16px;
-}
-
-.diff-table th {
-    position: sticky;
-    top: 0;
-    background: #e9ecef;
-    text-align: left;
-    padding: 0.35rem 0.6rem;
-    font-size: 0.62rem;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    border-bottom: 1px solid var(--border-color);
-    border-left: 1px solid var(--border-color);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-}
-
-.diff-table td {
-    padding: 1px 6px;
-    border: none;
-    vertical-align: top;
-    white-space: pre-wrap;
-    word-break: break-word;
-    line-height: 1.35;
-}
-
-.diff-table td.dl {
-    text-align: right;
-    color: var(--text-muted);
-    background: #f1f3f5;
-    user-select: none;
-    font-size: 0.68rem;
-    border-right: 1px solid var(--border-color);
-}
-
-.diff-table td.dm {
-    text-align: center;
+/* Matching marker in each pane's own line-number gutter. */
+.cm-gutter-del {
     font-weight: 700;
-    color: var(--text-primary);
-    user-select: none;
+    color: var(--red);
+    background: var(--red-bg);
 }
 
-.diff-table td.dt:nth-child(3) {
-    border-right: 2px solid var(--border-color);
+.cm-gutter-ins {
+    font-weight: 700;
+    color: var(--green);
+    background: var(--green-bg);
 }
 
-.d-same td.dt {
-    color: var(--text-secondary);
-}
-
-/* Removed / added / changed - monochrome; the marker column and the black
-   inset bar carry the meaning, so no colour is needed. */
-.d-del td.dt,
-.d-del td.dm,
-.d-ins td.dt,
-.d-ins td.dm {
-    background: #e9ecef;
-}
-
-.d-mod td.dt,
-.d-mod td.dm {
-    background: #f1f3f5;
-}
-
-.d-del td.dt:nth-child(3),
-.d-ins td.dt:nth-child(6),
-.d-mod td.dt {
-    box-shadow: inset 2px 0 0 var(--text-primary);
-}
-
-/* the side that has no line at all reads as a blank slot */
-.d-del td.dt:nth-child(6),
-.d-ins td.dt:nth-child(3) {
-    background: repeating-linear-gradient(135deg, #f8f9fa, #f8f9fa 4px, #e9ecef 4px, #e9ecef 8px);
-}
-
-.chg {
-    background: var(--text-primary);
-    color: #fff;
-}
-
-.d-skip td {
-    background: var(--bg-side);
-    color: var(--text-muted);
-    text-align: center;
-    font-size: 0.62rem;
-    letter-spacing: 1px;
-    text-transform: uppercase;
-    padding: 0.25rem;
-    border-top: 1px dotted var(--border-color);
-    border-bottom: 1px dotted var(--border-color);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-}
-
-.diff-table tr.focused td {
-    outline: 1px solid var(--text-primary);
-    outline-offset: -1px;
+/* Focused (from Prev/Next nav) is blue - a "you are here" marker, kept
+   visually distinct from the red/green change semantics. */
+.cm-focused-line {
+    box-shadow: inset 0 0 0 2px var(--blue);
 }
 
 /* Toast */
