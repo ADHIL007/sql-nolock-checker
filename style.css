@@ -25,6 +25,8 @@
     --blue-bg: #eaf1fd;
     --purple: #7548c4;
     --purple-bg: #f2edfb;
+    --teal: #0f7a72;
+    --teal-bg: #e3f4f2;
 }
 
 * {
@@ -80,7 +82,7 @@ header {
 
 .side-by-side {
     display: grid;
-    grid-template-columns: var(--audit-split, 1fr) 6px 1fr;
+    grid-template-columns: var(--script-split, 1fr) 6px 1fr;
     flex: 1;
     overflow: hidden;
     min-height: 0;
@@ -187,6 +189,31 @@ section {
     font-size: 0.8rem;
 }
 
+/* Fold gutter (Script Check only) - the vendored addon defaults to a glowing
+   blue marker; restyled to match this app's monochrome chrome instead. */
+.CodeMirror-foldmarker {
+    color: var(--text-secondary);
+    text-shadow: none;
+    font-family: inherit;
+    font-weight: 700;
+    padding: 0 3px;
+}
+
+.CodeMirror-foldgutter {
+    width: 12px;
+}
+
+.CodeMirror-foldgutter-open:after,
+.CodeMirror-foldgutter-folded:after {
+    color: var(--text-muted);
+    cursor: pointer;
+}
+
+.CodeMirror-foldgutter-open:hover:after,
+.CodeMirror-foldgutter-folded:hover:after {
+    color: var(--text-primary);
+}
+
 /* Token colours - matches the classic SSMS/VS Code T-SQL palette so this
    reads instantly to anyone who already lives in SQL Server tooling. */
 .cm-keyword  { color: #0451a5; font-weight: 600; }
@@ -205,12 +232,35 @@ section {
 .cm-issue-high,
 .cm-issue-critical { background: var(--red-bg); box-shadow: inset 3px 0 0 var(--red); }
 .cm-issue-review  { background: var(--purple-bg); box-shadow: inset 3px 0 0 var(--purple); }
+.cm-issue-go      { background: var(--teal-bg); box-shadow: inset 3px 0 0 var(--teal); }
 
 .cm-gutter-nolock  { background: var(--amber-bg) !important; color: var(--amber) !important; font-weight: 700; }
 .cm-gutter-nocount { background: var(--blue-bg) !important; color: var(--blue) !important; font-weight: 700; }
 .cm-gutter-high,
 .cm-gutter-critical { background: var(--red-bg) !important; color: var(--red) !important; font-weight: 700; }
 .cm-gutter-review  { background: var(--purple-bg) !important; color: var(--purple) !important; font-weight: 700; }
+.cm-gutter-go      { background: var(--teal-bg) !important; color: var(--teal) !important; font-weight: 700; }
+
+/* Scrollbar preview marks (addon/scroll/annotatescrollbar) - same solid
+   colour as that finding's accent bar/tag, so the scrollbar shows at a
+   glance where every issue sits before you scroll to it. The addon sizes
+   each mark to the native scrollbar's own width and clamps height to a
+   3px minimum, which measures out to a near-invisible sliver (the native
+   track itself is often only 6-7px wide) - widened and thickened here,
+   plus a dark hairline so the colour still reads against a light track. */
+[class^="cm-scrollmark-"] {
+    width: 13px !important;
+    min-height: 7px;
+    border-radius: 2px;
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+}
+
+.cm-scrollmark-nolock   { background: var(--amber); }
+.cm-scrollmark-nocount  { background: var(--blue); }
+.cm-scrollmark-high,
+.cm-scrollmark-critical { background: var(--red); }
+.cm-scrollmark-review   { background: var(--purple); }
+.cm-scrollmark-go       { background: var(--teal); }
 
 /* Table Design */
 .table-container {
@@ -554,6 +604,12 @@ td {
     border-color: var(--purple);
 }
 
+.tag-go {
+    background: var(--teal-bg);
+    color: var(--teal);
+    border-color: var(--teal);
+}
+
 .tag-dyn {
     margin-left: 3px;
     background: #fff;
@@ -784,6 +840,16 @@ tr.sev-high .issue-cell {
     background: var(--green-bg);
 }
 
+/* Scrollbar preview marks (addon/scroll/annotatescrollbar) - same red/green
+   as the line background and gutter marker above. */
+.cm-scrollmark-del {
+    background: var(--red);
+}
+
+.cm-scrollmark-ins {
+    background: var(--green);
+}
+
 /* Focused (from Prev/Next nav) is blue - a "you are here" marker, kept
    visually distinct from the red/green change semantics. */
 .cm-focused-line {
@@ -810,6 +876,13 @@ tr.sev-high .issue-cell {
     .side-by-side {
         grid-template-columns: 1fr;
         grid-template-rows: 1fr 1fr;
+    }
+
+    /* the resizer is a 3rd grid item with no column/row of its own; on the
+       single-column mobile layout it would otherwise claim a full 1fr row
+       (dragging between stacked panes isn't useful here anyway) */
+    .side-by-side .resizer {
+        display: none;
     }
 
     .editor-section {

@@ -67,7 +67,8 @@ const RULES = {
     SEC001: { cat: 'security', msg: 'String parameter concatenated into executed dynamic SQL' },
     SEC002: { cat: 'security', msg: 'Caller supplied identifier or predicate in dynamic SQL' },
     SEC003: { cat: 'security', msg: 'Dynamic SQL executed against a linked server' },
-    SEC004: { cat: 'security', msg: 'Credential in plain text' }
+    SEC004: { cat: 'security', msg: 'Credential in plain text' },
+    GO001: { cat: 'go', msg: 'Missing GO batch separator' }
 };
 
 /* ------------------------- security analysis vocabulary ------------------- */
@@ -1078,6 +1079,129 @@ function applyFixes(sql, findings) {
     return { sql: out, count: n };
 }
 
+/* ================================ SCRIPT CHECK ==============================
+   For a whole script dump (many CREATE/ALTER PROCEDURE|FUNCTION|TRIGGER|VIEW
+   batches back to back), not a single pasted proc: reuses analyze() as-is for
+   NOLOCK/NOCOUNT/security (unchanged, zero regression risk to the audit view),
+   adds a check for a missing GO batch separator between objects, and counts
+   each object kind. Deliberately a separate object scanner from findModules()
+   above rather than extending it - findModules() is also used by the NOCOUNT
+   and security engines, which have their own tested assumptions (e.g. a
+   FUNCTION body can't contain SET, so it's skipped there); teaching it about
+   VIEW as well would need matching guards added in three places for no
+   benefit here, since this check only needs header positions. ========== */
+
+function findScriptObjects(codeDoc) {
+    const re = /\b(CREATE|ALTER)\s+(PROCEDURE|PROC|FUNCTION|TRIGGER|VIEW)\s+((?:\[[^\]]*\]|[A-Za-z_][\w$#]*)(?:\s*\.\s*(?:\[[^\]]*\]|[A-Za-z_][\w$#]*))*)/gi;
+    const objs = [];
+    let m;
+    while ((m = re.exec(codeDoc)) !== null) {
+        const kind = m[2].toUpperCase() === 'PROC' ? 'PROCEDURE' : m[2].toUpperCase();
+        objs.push({ kind: kind, name: m[3].replace(/\s+/g, ''), s: m.index, e: codeDoc.length });
+    }
+    objs.forEach((o, k) => { if (objs[k + 1]) o.e = objs[k + 1].s; });
+    return objs;
+}
+
+/* A standalone GO on its own line (optionally "GO 5" to repeat the batch,
+   per real T-SQL batch syntax) anywhere between one object and the next
+   counts as present - this checks presence, not exact placement. Comments
+   are already blanked in codeDoc, so a comment-only line reads as blank and
+   never false-matches. */
+const STANDALONE_GO_RE = /^[ \t]*GO(?:[ \t]+\d+)?[ \t]*$/im;
+
+function analyzeGo(sql, codeDoc, lineOf, objs, findings) {
+    objs.forEach((obj, i) => {
+        const isLast = i === objs.length - 1;
+        const gapEnd = isLast ? codeDoc.length : objs[i + 1].s;
+        const gap = codeDoc.slice(obj.s, gapEnd);
+        if (STANDALONE_GO_RE.test(gap)) return;
+        const kindLabel = obj.kind.charAt(0) + obj.kind.slice(1).toLowerCase();
+        const msg = isLast
+            ? kindLabel + ' ' + obj.name + ' has no trailing GO before end of script'
+            : kindLabel + ' ' + obj.name + ' has no GO before the next batch (' + objs[i + 1].name + ')';
+        const f = mkFinding('GO001', lineOf(obj.s), obj.name, msg, snipAt(sql, obj.s), null);
+        f.off = obj.s;
+        findings.push(f);
+    });
+}
+
+/* Runs the full existing audit (unchanged) plus the GO check, and counts each
+   object kind for the summary ribbon. */
+function analyzeScript(sql) {
+    const result = analyze(sql);
+    const spans = lexSpans(sql);
+    const codeDoc = blankSpans(blankSpans(sql, spans.comments), spans.strings);
+    const lineOf = makeLineOf(lineStartsOf(sql));
+    const objs = findScriptObjects(codeDoc);
+
+    analyzeGo(sql, codeDoc, lineOf, objs, result.findings);
+    result.findings.sort((a, b) => (a.line - b.line) || (a.off - b.off));
+
+    const counts = { PROCEDURE: 0, FUNCTION: 0, TRIGGER: 0, VIEW: 0 };
+    objs.forEach(o => { counts[o.kind]++; });
+    result.objectCounts = counts;
+    result.goMissing = result.findings.filter(f => f.rule === 'GO001').length;
+    return result;
+}
+
+/* --------------------------------- format ---------------------------------
+   vendor/sql-formatter.min.js (github.com/sql-formatter-org/sql-formatter, MIT).
+   Two T-SQL things it doesn't know about:
+   (1) "GO" is an SSMS/sqlcmd client directive, not part of SQL grammar, so
+       left alone it glues "END GO CREATE PROCEDURE..." onto one line, which
+       no longer parses as separate batches. Split on real standalone GO
+       lines first (codeDoc-based, so a GO inside a string/comment is
+       correctly ignored - same check as analyzeGo above), format each batch
+       independently, then rejoin with GO.
+   (2) a table hint - "WITH (NOLOCK)" etc, the whole reason this tool exists -
+       gets misread as a CTE's WITH clause and split apart ("Users u\nWITH\n
+       (NOLOCK)"). Protected per batch: every "WITH (...)" span is swapped
+       for a plain-word placeholder token before formatting (a CTE never
+       matches this - CTE syntax is always "WITH name AS (", never "WITH ("
+       directly) and restored, uppercased, straight after. */
+function protectTableHints(sql) {
+    const map = [];
+    const text = sql.replace(/\bWITH\s*(\([^()]*\))/gi, full => {
+        const token = 'ZzHINTzZ' + map.length + 'ZzEND';
+        map.push(full.toUpperCase());
+        return token;
+    });
+    return { text, map };
+}
+
+function restoreTableHints(text, map) {
+    return text.replace(/ZzHINTzZ(\d+)ZzEND/g, (m, i) => map[Number(i)]);
+}
+
+function formatSql(sql) {
+    const spans = lexSpans(sql);
+    const codeDoc = blankSpans(blankSpans(sql, spans.comments), spans.strings);
+    const lines = sql.split('\n');
+    const codeLines = codeDoc.split('\n');
+    const batches = [];
+    let start = 0;
+    for (let i = 0; i < codeLines.length; i++) {
+        if (STANDALONE_GO_RE.test(codeLines[i])) {
+            batches.push(lines.slice(start, i).join('\n'));
+            start = i + 1;
+        }
+    }
+    batches.push(lines.slice(start).join('\n'));
+
+    return batches.map(batch => {
+        const trimmed = batch.trim();
+        if (!trimmed) return '';
+        try {
+            const protected_ = protectTableHints(trimmed);
+            const formatted = sqlFormatter.format(protected_.text, { language: 'tsql', keywordCase: 'upper' });
+            return restoreTableHints(formatted, protected_.map);
+        } catch (e) {
+            return batch;   /* formatter choked on this batch - leave it untouched rather than losing text */
+        }
+    }).join('\nGO\n');
+}
+
 /* ================================ SQL COMPARE ==============================
    Line diff comes from jsdiff (vendor/diff.min.js, BSD-3-Clause). Rows are
    aligned into a side by side view here, and paired changed lines get a word
@@ -1248,50 +1372,100 @@ const CM_OPTIONS = {
     lineWrapping: false
 };
 
+/* Script Check only: folds a CREATE/ALTER PROCEDURE|FUNCTION|TRIGGER|VIEW
+   header down to its matching GO (or the next such header, or end of file)
+   - "collapse the SPs like SSMS". Combined with the vendored generic
+   brace-paren folder, so a plain "CREATE TABLE #tmp (...)" also folds on its
+   own parens, same as the SSMS screenshot this was built from. Written
+   against cm.getLine() directly rather than the audit engine's codeDoc, so
+   it stays simple and self-contained; it is a fold trigger, not an audit
+   finding, so it does not need comment/string-aware masking to be useful. */
+function sqlBatchFold(cm, start) {
+    const HEADER_RE = /^\s*(CREATE|ALTER)\s+(PROCEDURE|PROC|FUNCTION|TRIGGER|VIEW)\b/i;
+    const line = start.line;
+    const lineText = cm.getLine(line);
+    if (!HEADER_RE.test(lineText)) return null;
+
+    const lastLine = cm.lastLine();
+    for (let i = line + 1; i <= lastLine; i++) {
+        const text = cm.getLine(i);
+        if (/^[ \t]*GO(?:[ \t]+\d+)?[ \t]*$/i.test(text) || HEADER_RE.test(text)) {
+            if (i - 1 <= line) return null;
+            return { from: CodeMirror.Pos(line, lineText.length), to: CodeMirror.Pos(i - 1, cm.getLine(i - 1).length) };
+        }
+    }
+    if (lastLine > line) {
+        return { from: CodeMirror.Pos(line, lineText.length), to: CodeMirror.Pos(lastLine, cm.getLine(lastLine).length) };
+    }
+    return null;
+}
+
+const CM_OPTIONS_SCRIPT = Object.assign({}, CM_OPTIONS, {
+    foldGutter: true,
+    gutters: ['CodeMirror-linenumbers', 'CodeMirror-foldgutter'],
+    foldOptions: {
+        widget: '…',
+        rangeFinder: CodeMirror.fold.combine(sqlBatchFold, CodeMirror.fold['brace-paren']),
+        foldOnChangeTimeSpan: 150   /* addon default is 600ms - too sluggish after pasting a big script */
+    }
+});
+
 document.addEventListener('DOMContentLoaded', () => {
     const $ = id => document.getElementById(id);
 
-    /* audit */
-    let sqlCm = CodeMirror.fromTextArea($('sqlInput'), CM_OPTIONS);
-    const resultsBody = $('resultsBody');
-    const resultsTableContainer = $('resultsTableContainer');
-    const emptyState = $('emptyState');
-    const allClearState = $('allClearState');
-    const issueCountBadge = $('issueCount');
-    const summaryText = $('summaryText');
-    const filterBar = $('filterBar');
-    const searchBox = $('searchBox');
-    const editorMeta = $('editorMeta');
+    /* One scrollbar-annotation track per severity colour, so the scrollbar
+       itself previews where each kind of finding sits before you scroll -
+       same colours as the line/gutter/tag marks, via addon/scroll. 'go' is
+       only ever produced in Script Check, but it's harmless (always empty)
+       on the audit editor, so one shared list keeps both in step. */
+    const SEVERITY_CLASSES = ['critical', 'high', 'nolock', 'nocount', 'review', 'go'];
+
     const toast = $('toast');
 
     /* compare */
     let leftCm = CodeMirror.fromTextArea($('leftInput'), CM_OPTIONS);
     let rightCm = CodeMirror.fromTextArea($('rightInput'), CM_OPTIONS);
+    const leftScrollAnn = leftCm.annotateScrollbar('cm-scrollmark-del');
+    const rightScrollAnn = rightCm.annotateScrollbar('cm-scrollmark-ins');
     const diffSummary = $('diffSummary');
 
-    let current = null;
-    let tab = 'all';
-    let sortKey = 'line';
-    let sortDir = 1;
-    let undoBuffer = null;
+    /* script check */
+    let scriptCm = CodeMirror.fromTextArea($('scriptInput'), CM_OPTIONS_SCRIPT);
+    const scriptScrollAnns = {};
+    SEVERITY_CLASSES.forEach(c => { scriptScrollAnns[c] = scriptCm.annotateScrollbar('cm-scrollmark-' + c); });
+    const scriptResultsBody = $('scriptResultsBody');
+    const scriptResultsTableContainer = $('scriptResultsTableContainer');
+    const scriptEmptyState = $('scriptEmptyState');
+    const scriptAllClearState = $('scriptAllClearState');
+    const scriptIssueCountBadge = $('scriptIssueCount');
+    const scriptSummaryText = $('scriptSummaryText');
+    const scriptSearchBox = $('scriptSearchBox');
+    const scriptMeta = $('scriptMeta');
+
     let diffMarks = [];
     let markPos = -1;
+    let currentScript = null;
+    let scriptUndoBuffer = null;
+    let scriptTab = 'all';
+    let scriptSortKey = 'line';
+    let scriptSortDir = 1;
 
     /* ------------------------------ mode switch ---------------------------- */
 
     function setMode(mode) {
-        const audit = mode === 'audit';
-        $('auditView').classList.toggle('hidden', !audit);
-        $('compareView').classList.toggle('hidden', audit);
-        $('auditActions').classList.toggle('hidden', !audit);
-        $('compareActions').classList.toggle('hidden', audit);
+        const cms = { compare: leftCm, script: scriptCm };
+        ['compare', 'script'].forEach(m => {
+            $(m + 'View').classList.toggle('hidden', m !== mode);
+        });
+        $('compareActions').classList.toggle('hidden', mode !== 'compare');
+        $('scriptActions').classList.toggle('hidden', mode !== 'script');
         document.querySelectorAll('.mode').forEach(b =>
             b.classList.toggle('active', b.dataset.mode === mode));
         /* the pane was hidden (display:none) while inactive, so CodeMirror's
            cached measurements are stale until it is visible again */
-        (audit ? sqlCm : leftCm).refresh();
-        if (!audit) rightCm.refresh();
-        (audit ? sqlCm : leftCm).focus();
+        cms[mode].refresh();
+        if (mode === 'compare') rightCm.refresh();
+        cms[mode].focus();
     }
 
     $('modeSwitch').addEventListener('click', e => {
@@ -1300,7 +1474,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     function activeMode() {
-        return $('auditView').classList.contains('hidden') ? 'compare' : 'audit';
+        return $('compareView').classList.contains('hidden') ? 'script' : 'compare';
     }
 
     /* -------------------------------- helpers ------------------------------ */
@@ -1335,59 +1509,12 @@ document.addEventListener('DOMContentLoaded', () => {
         const sev = f.cat === 'security' ? (/^(CRITICAL|HIGH|REVIEW)\b/.exec(f.msg) || [, 'REVIEW'])[1] : null;
         const cls = sev ? sev.toLowerCase() : f.cat;
         const accent = sev ? (sev === 'REVIEW' ? 'var(--purple)' : 'var(--red)')
-                     : f.cat === 'nolock' ? 'var(--amber)' : 'var(--blue)';
-        return { sev: sev, cls: cls, tagLabel: sev || (f.cat === 'nolock' ? 'NOLOCK' : 'NOCOUNT'), accent: accent };
+                     : f.cat === 'nolock' ? 'var(--amber)'
+                     : f.cat === 'go' ? 'var(--teal)'
+                     : 'var(--blue)';
+        const tagLabel = sev || (f.cat === 'nolock' ? 'NOLOCK' : f.cat === 'go' ? 'MISSING GO' : 'NOCOUNT');
+        return { sev: sev, cls: cls, tagLabel: tagLabel, accent: accent };
     }
-
-    /* ------------------------------ audit editor --------------------------- */
-
-    function clearIssueMarks() {
-        sqlCm.operation(() => {
-            for (let i = 0; i < sqlCm.lineCount(); i++) {
-                sqlCm.removeLineClass(i, 'background');
-                sqlCm.removeLineClass(i, 'gutter');
-            }
-        });
-    }
-
-    /* Paints every finding's line background + gutter cell. CodeMirror owns
-       its own rendering and scrolling, so - unlike the old hand-rolled
-       overlay - there is nothing here that can drift out of sync with what
-       is actually on screen: it is the same surface, not a second one. */
-    function markIssues() {
-        clearIssueMarks();
-        if (!current) return;
-        sqlCm.operation(() => {
-            current.findings.forEach(f => {
-                const style = findingStyle(f);
-                sqlCm.addLineClass(f.line - 1, 'background', 'cm-issue-' + style.cls);
-                sqlCm.addLineClass(f.line - 1, 'gutter', 'cm-gutter-' + style.cls);
-            });
-        });
-    }
-
-    function updateEditorMeta() {
-        editorMeta.textContent = sqlCm.lineCount() + ' LINES / ' + sqlCm.getValue().length + ' CHARS';
-    }
-
-    /* Editing after Run Analyze must drop the results table, not just the
-       line marks - a stale row's line number no longer matches the edited
-       text, so clicking it would select an unrelated line instead of what
-       was actually flagged. */
-    sqlCm.on('change', () => {
-        updateEditorMeta();
-        if (current) {
-            current = null;
-            clearIssueMarks();
-            resultsBody.innerHTML = '';
-            issueCountBadge.textContent = '0 Errors';
-            issueCountBadge.className = 'badge';
-            summaryText.textContent = 'Edited - Run Analyze again';
-            $('fixBtn').disabled = true;
-            $('exportBtn').disabled = true;
-            showState('empty');
-        }
-    });
 
     /* -------------------------------- drag & drop --------------------------- */
 
@@ -1436,7 +1563,6 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    setupDropZone($('auditDrop'), text => sqlCm.setValue(text), run);
     setupDropZone($('leftDrop'), text => leftCm.setValue(text), refreshCompare);
     setupDropZone($('rightDrop'), text => rightCm.setValue(text), refreshCompare);
 
@@ -1505,181 +1631,8 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    makeResizable(document.querySelector('.side-by-side'), $('auditResizer'), '--audit-split', 'sqltools-audit-split',
-        () => sqlCm.refresh());
     makeResizable(document.querySelector('.compare-inputs'), $('cmpResizer'), '--cmp-split', 'sqltools-cmp-split',
         () => { leftCm.refresh(); rightCm.refresh(); });
-
-    function showState(state) {
-        emptyState.classList.add('hidden');
-        resultsTableContainer.classList.add('hidden');
-        allClearState.classList.add('hidden');
-        if (state === 'results') resultsTableContainer.classList.remove('hidden');
-        else if (state === 'clear') allClearState.classList.remove('hidden');
-        else emptyState.classList.remove('hidden');
-    }
-
-    /* --------------------------------- audit ------------------------------- */
-
-    function run() {
-        const sql = sqlCm.getValue();
-        if (!sql.trim()) { flash('Nothing to analyze.'); return; }
-
-        current = analyze(sql);
-        markIssues();
-
-        const security = current.findings.filter(f => f.cat === 'security').length;
-        const nolock = current.findings.filter(f => f.cat === 'nolock').length;
-        const nocount = current.findings.filter(f => f.cat === 'nocount').length;
-        const total = security + nolock + nocount;
-
-        issueCountBadge.textContent = total
-            ? total + ' ERROR' + (total === 1 ? '' : 'S') +
-              (security ? ' · ' + security + ' SECURITY' : '') +
-              ' · ' + nolock + ' NOLOCK / ' + nocount + ' NOCOUNT'
-            : '0 Errors';
-        issueCountBadge.className = total ? (security ? 'badge danger' : 'badge') : 'badge success';
-        summaryText.textContent = security ? 'Security Risk Found' : total ? 'Errors Found' : 'All Clear';
-
-        $('fixBtn').disabled = !current.findings.some(f => f.fix);
-        $('exportBtn').disabled = !current.findings.length;
-        render();
-    }
-
-    function visibleRows() {
-        if (!current) return [];
-        const q = searchBox.value.trim().toLowerCase();
-        let rows = current.findings.filter(f => tab === 'all' || f.cat === tab);
-        if (q) {
-            rows = rows.filter(f =>
-                (f.line + ' ' + f.obj + ' ' + f.rule + ' ' + f.msg + ' ' + f.ctx).toLowerCase().indexOf(q) >= 0);
-        }
-        rows.sort((a, b) => {
-            let d = 0;
-            if (sortKey === 'line') d = a.line - b.line;
-            else if (sortKey === 'type') d = a.cat < b.cat ? -1 : a.cat > b.cat ? 1 : 0;
-            else if (sortKey === 'obj') d = a.obj.toLowerCase() < b.obj.toLowerCase() ? -1 : 1;
-            return d * sortDir || a.off - b.off;
-        });
-        return rows;
-    }
-
-    function render() {
-        const rows = visibleRows();
-        if (!rows.length) {
-            resultsBody.innerHTML = '';
-            if (!current) { showState('empty'); return; }
-            const filtered = searchBox.value.trim() || tab !== 'all';
-            allClearState.querySelector('h3').textContent = filtered ? 'Nothing In This View' : 'All Clear';
-            allClearState.querySelector('p').textContent = filtered
-                ? 'No errors match the current tab or filter text.'
-                : 'Every read source has NOLOCK and every module sets NOCOUNT ON.';
-            showState('clear');
-            return;
-        }
-        showState('results');
-        resultsBody.innerHTML = rows.map(f => {
-            const style = findingStyle(f);
-            return '<tr data-line="' + f.line + '"' + (style.sev ? ' class="sev-' + style.cls + '"' : '') +
-                ' style="--row-accent:' + style.accent + '">' +
-                '<td class="line-cell">' + f.line + '</td>' +
-                '<td><span class="tag tag-' + style.cls + '">' + style.tagLabel + '</span>' +
-                (f.dynamic ? '<span class="tag tag-dyn">DYN</span>' : '') +
-                (f.fix ? '<span class="fixable" title="auto fixable">&#9670;</span>' : '') + '</td>' +
-                '<td class="obj-cell"><b>' + escHtml(f.obj) + '</b></td>' +
-                '<td class="issue-cell">' + escHtml(f.msg) + '</td>' +
-                '<td class="snippet-cell">' + escHtml(f.ctx) + '</td>' +
-                '</tr>';
-        }).join('');
-    }
-
-    function jumpToLine(num) {
-        if (num < 1 || num > sqlCm.lineCount()) return;
-        const lineLen = sqlCm.getLine(num - 1).length;
-        sqlCm.setSelection({ line: num - 1, ch: 0 }, { line: num - 1, ch: lineLen });
-        sqlCm.scrollIntoView({ line: num - 1, ch: 0 }, 120);
-        sqlCm.focus();
-    }
-
-    resultsBody.addEventListener('click', e => {
-        const tr = e.target.closest('tr');
-        if (tr && tr.dataset.line) jumpToLine(parseInt(tr.dataset.line, 10));
-    });
-
-    $('tabs').addEventListener('click', e => {
-        const b = e.target.closest('.tab');
-        if (!b) return;
-        document.querySelectorAll('#tabs .tab').forEach(x => x.classList.remove('active'));
-        b.classList.add('active');
-        tab = b.dataset.tab;
-        render();
-    });
-
-    document.querySelectorAll('th.sortable').forEach(th => {
-        th.addEventListener('click', () => {
-            const k = th.dataset.sort;
-            sortDir = (k === sortKey) ? -sortDir : 1;
-            sortKey = k;
-            document.querySelectorAll('th.sortable').forEach(x => x.classList.remove('sorted'));
-            th.classList.add('sorted');
-            render();
-        });
-    });
-
-    searchBox.addEventListener('input', render);
-    $('analyzeBtn').addEventListener('click', run);
-
-    $('clearBtn').addEventListener('click', () => {
-        sqlCm.setValue('');
-        current = null;
-        undoBuffer = null;
-        clearIssueMarks();
-        resultsBody.innerHTML = '';
-        issueCountBadge.textContent = '0 Errors';
-        issueCountBadge.className = 'badge';
-        summaryText.textContent = 'Ready to Analyze';
-        $('fixBtn').disabled = true;
-        $('exportBtn').disabled = true;
-        $('undoBtn').disabled = true;
-        showState('empty');
-    });
-
-    $('fixBtn').addEventListener('click', () => {
-        if (!current) return;
-        undoBuffer = sqlCm.getValue();
-        const res = applyFixes(undoBuffer, current.findings);
-        sqlCm.setValue(res.sql);
-        $('undoBtn').disabled = false;
-        run();
-        flash('Applied ' + res.count + ' fix' + (res.count === 1 ? '' : 'es') + '. Review before deploying.');
-    });
-
-    $('undoBtn').addEventListener('click', () => {
-        if (undoBuffer === null) return;
-        sqlCm.setValue(undoBuffer);
-        undoBuffer = null;
-        $('undoBtn').disabled = true;
-        run();
-        flash('Auto fix reverted.');
-    });
-
-    $('copyBtn').addEventListener('click', () => copyText(sqlCm.getValue(), 'SQL copied.'));
-
-    $('exportBtn').addEventListener('click', () => {
-        if (!current || !current.findings.length) return;
-        const rows = visibleRows();
-        const q = v => '"' + String(v).replace(/"/g, '""') + '"';
-        const csv = [['Line', 'Type', 'Rule', 'Object', 'Error', 'Context'].join(',')].concat(
-            rows.map(f => [f.line, f.cat.toUpperCase(), f.rule, f.obj, f.msg, f.ctx].map(q).join(','))
-        ).join('\r\n');
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' }));
-        a.download = 'nolock_nocount_errors.csv';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        flash('Exported ' + rows.length + ' rows.');
-    });
 
     /* -------------------------------- compare ------------------------------
        One live pane per side: the editor IS the diff output, not a separate
@@ -1712,14 +1665,20 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             cm.getAllMarks().forEach(m => m.clear());
         });
+        leftScrollAnn.update([]);
+        rightScrollAnn.update([]);
     }
 
     /* Walks jsdiff's row list once, applying line/gutter classes and word
        level marks directly via the CodeMirror API - no HTML is built at all.
+       Also feeds the same positions to each pane's scrollbar annotation
+       (addon/scroll/annotatescrollbar) so the red/green marks on the
+       scrollbar itself preview where every change sits before you scroll.
        Returns the list of changed-row positions for the Prev/Next nav. */
     function applyCompareMarks(rows) {
         clearCompareMarks();
         const marks = [];
+        const leftScroll = [], rightScroll = [];
         let li = 0, ri = 0;
         leftCm.operation(() => {
             rightCm.operation(() => {
@@ -1728,11 +1687,13 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (r.t === 'del') {
                         leftCm.addLineClass(li, 'background', 'hl-del');
                         leftCm.addLineClass(li, 'gutter', 'cm-gutter-del');
+                        leftScroll.push({ from: { line: li, ch: 0 }, to: { line: li, ch: 0 } });
                         marks.push({ lline: li, rline: null });
                         li++;
                     } else if (r.t === 'ins') {
                         rightCm.addLineClass(ri, 'background', 'hl-ins');
                         rightCm.addLineClass(ri, 'gutter', 'cm-gutter-ins');
+                        rightScroll.push({ from: { line: ri, ch: 0 }, to: { line: ri, ch: 0 } });
                         marks.push({ lline: null, rline: ri });
                         ri++;
                     } else {
@@ -1741,6 +1702,8 @@ document.addEventListener('DOMContentLoaded', () => {
                         rightCm.addLineClass(ri, 'background', 'hl-mod-ins');
                         rightCm.addLineClass(ri, 'gutter', 'cm-gutter-ins');
                         markWordDiff(leftCm, li, rightCm, ri, r.left, r.right);
+                        leftScroll.push({ from: { line: li, ch: 0 }, to: { line: li, ch: 0 } });
+                        rightScroll.push({ from: { line: ri, ch: 0 }, to: { line: ri, ch: 0 } });
                         marks.push({ lline: li, rline: ri });
                         li++;
                         ri++;
@@ -1748,6 +1711,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 });
             });
         });
+        leftScrollAnn.update(leftScroll);
+        rightScrollAnn.update(rightScroll);
         return marks;
     }
 
@@ -1858,13 +1823,258 @@ document.addEventListener('DOMContentLoaded', () => {
 
     ['optCase', 'optWs', 'optCmt'].forEach(id => $(id).addEventListener('change', refreshCompare));
 
-    document.addEventListener('keydown', e => {
-        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-            e.preventDefault();
-            if (activeMode() === 'audit') run(); else refreshCompare();
+    /* ------------------------------ script check ----------------------------
+       For a whole script dump, not one pasted proc: reuses analyzeScript()
+       (itself a thin wrapper over the unchanged analyze()) so NOLOCK/NOCOUNT/
+       security work exactly as in the Audit view, plus a missing-GO check and
+       object counts. The editor also gets a fold gutter (SSMS-style outlining)
+       via CM_OPTIONS_SCRIPT, set up once above. -------------------------- */
+
+    function clearScriptIssueMarks() {
+        scriptCm.operation(() => {
+            for (let i = 0; i < scriptCm.lineCount(); i++) {
+                scriptCm.removeLineClass(i, 'background');
+                scriptCm.removeLineClass(i, 'gutter');
+            }
+        });
+        SEVERITY_CLASSES.forEach(c => scriptScrollAnns[c].update([]));
+    }
+
+    function markScriptIssues() {
+        clearScriptIssueMarks();
+        if (!currentScript) return;
+        const bySeverity = {};
+        SEVERITY_CLASSES.forEach(c => { bySeverity[c] = []; });
+        scriptCm.operation(() => {
+            currentScript.findings.forEach(f => {
+                const style = findingStyle(f);
+                scriptCm.addLineClass(f.line - 1, 'background', 'cm-issue-' + style.cls);
+                scriptCm.addLineClass(f.line - 1, 'gutter', 'cm-gutter-' + style.cls);
+                bySeverity[style.cls].push({ from: { line: f.line - 1, ch: 0 }, to: { line: f.line - 1, ch: 0 } });
+            });
+        });
+        SEVERITY_CLASSES.forEach(c => scriptScrollAnns[c].update(bySeverity[c]));
+    }
+
+    function updateScriptMeta() {
+        scriptMeta.textContent = scriptCm.lineCount() + ' LINES / ' + scriptCm.getValue().length + ' CHARS';
+    }
+
+    scriptCm.on('change', () => {
+        updateScriptMeta();
+        if (currentScript) {
+            currentScript = null;
+            clearScriptIssueMarks();
+            scriptResultsBody.innerHTML = '';
+            scriptIssueCountBadge.textContent = '0 Errors';
+            scriptIssueCountBadge.className = 'badge';
+            scriptSummaryText.textContent = 'Edited - Run Check again';
+            $('fixScriptBtn').disabled = true;
+            $('exportScriptBtn').disabled = true;
+            scriptShowState('empty');
         }
     });
 
-    updateEditorMeta();
+    function scriptShowState(state) {
+        scriptEmptyState.classList.add('hidden');
+        scriptResultsTableContainer.classList.add('hidden');
+        scriptAllClearState.classList.add('hidden');
+        if (state === 'results') scriptResultsTableContainer.classList.remove('hidden');
+        else if (state === 'clear') scriptAllClearState.classList.remove('hidden');
+        else scriptEmptyState.classList.remove('hidden');
+    }
+
+    function scriptRun() {
+        const sql = scriptCm.getValue();
+        if (!sql.trim()) { flash('Nothing to check.'); return; }
+
+        currentScript = analyzeScript(sql);
+        markScriptIssues();
+
+        const security = currentScript.findings.filter(f => f.cat === 'security').length;
+        const nolock = currentScript.findings.filter(f => f.cat === 'nolock').length;
+        const nocount = currentScript.findings.filter(f => f.cat === 'nocount').length;
+        const total = security + nolock + nocount + currentScript.goMissing;
+
+        scriptIssueCountBadge.textContent = total
+            ? total + ' ERROR' + (total === 1 ? '' : 'S') +
+              (security ? ' · ' + security + ' SECURITY' : '') +
+              ' · ' + nolock + ' NOLOCK / ' + nocount + ' NOCOUNT / ' + currentScript.goMissing + ' GO'
+            : '0 Errors';
+        scriptIssueCountBadge.className = total ? (security ? 'badge danger' : 'badge') : 'badge success';
+        scriptSummaryText.textContent = security ? 'Security Risk Found' : total ? 'Errors Found' : 'All Clear';
+
+        $('fixScriptBtn').disabled = !currentScript.findings.some(f => f.fix);
+        $('exportScriptBtn').disabled = !currentScript.findings.length;
+        scriptRenderResults();
+    }
+
+    function scriptVisibleRows() {
+        if (!currentScript) return [];
+        const q = scriptSearchBox.value.trim().toLowerCase();
+        let rows = currentScript.findings.filter(f => scriptTab === 'all' || f.cat === scriptTab);
+        if (q) {
+            rows = rows.filter(f =>
+                (f.line + ' ' + f.obj + ' ' + f.rule + ' ' + f.msg + ' ' + f.ctx).toLowerCase().indexOf(q) >= 0);
+        }
+        rows.sort((a, b) => {
+            let d = 0;
+            if (scriptSortKey === 'line') d = a.line - b.line;
+            else if (scriptSortKey === 'type') d = a.cat < b.cat ? -1 : a.cat > b.cat ? 1 : 0;
+            else if (scriptSortKey === 'obj') d = a.obj.toLowerCase() < b.obj.toLowerCase() ? -1 : 1;
+            return d * scriptSortDir || a.off - b.off;
+        });
+        return rows;
+    }
+
+    function scriptRenderResults() {
+        const rows = scriptVisibleRows();
+        if (!rows.length) {
+            scriptResultsBody.innerHTML = '';
+            if (!currentScript) { scriptShowState('empty'); return; }
+            const filtered = scriptSearchBox.value.trim() || scriptTab !== 'all';
+            scriptAllClearState.querySelector('h3').textContent = filtered ? 'Nothing In This View' : 'All Clear';
+            scriptAllClearState.querySelector('p').textContent = filtered
+                ? 'No errors match the current tab or filter text.'
+                : 'Every read source has NOLOCK, every module sets NOCOUNT ON, every batch has a GO, and no security issues found.';
+            scriptShowState('clear');
+            return;
+        }
+        scriptShowState('results');
+        scriptResultsBody.innerHTML = rows.map(f => {
+            const style = findingStyle(f);
+            return '<tr data-line="' + f.line + '"' + (style.sev ? ' class="sev-' + style.cls + '"' : '') +
+                ' style="--row-accent:' + style.accent + '">' +
+                '<td class="line-cell">' + f.line + '</td>' +
+                '<td><span class="tag tag-' + style.cls + '">' + style.tagLabel + '</span>' +
+                (f.dynamic ? '<span class="tag tag-dyn">DYN</span>' : '') +
+                (f.fix ? '<span class="fixable" title="auto fixable">&#9670;</span>' : '') + '</td>' +
+                '<td class="obj-cell"><b>' + escHtml(f.obj) + '</b></td>' +
+                '<td class="issue-cell">' + escHtml(f.msg) + '</td>' +
+                '<td class="snippet-cell">' + escHtml(f.ctx) + '</td>' +
+                '</tr>';
+        }).join('');
+    }
+
+    function scriptJumpToLine(num) {
+        if (num < 1 || num > scriptCm.lineCount()) return;
+        /* jumping to a line inside a folded batch must open it first, or the
+           line silently stays hidden inside the collapsed widget */
+        scriptCm.findMarksAt(CodeMirror.Pos(num - 1, 0)).forEach(m => { if (m.__isFold) m.clear(); });
+        const lineLen = scriptCm.getLine(num - 1).length;
+        scriptCm.setSelection({ line: num - 1, ch: 0 }, { line: num - 1, ch: lineLen });
+        scriptCm.scrollIntoView({ line: num - 1, ch: 0 }, 120);
+        scriptCm.focus();
+    }
+
+    scriptResultsBody.addEventListener('click', e => {
+        const tr = e.target.closest('tr');
+        if (tr && tr.dataset.line) scriptJumpToLine(parseInt(tr.dataset.line, 10));
+    });
+
+    $('scriptTabs').addEventListener('click', e => {
+        const b = e.target.closest('.tab');
+        if (!b) return;
+        document.querySelectorAll('#scriptTabs .tab').forEach(x => x.classList.remove('active'));
+        b.classList.add('active');
+        scriptTab = b.dataset.tab;
+        scriptRenderResults();
+    });
+
+    document.querySelectorAll('#scriptResultsTable th.sortable').forEach(th => {
+        th.addEventListener('click', () => {
+            const k = th.dataset.sort;
+            scriptSortDir = (k === scriptSortKey) ? -scriptSortDir : 1;
+            scriptSortKey = k;
+            document.querySelectorAll('#scriptResultsTable th.sortable').forEach(x => x.classList.remove('sorted'));
+            th.classList.add('sorted');
+            scriptRenderResults();
+        });
+    });
+
+    scriptSearchBox.addEventListener('input', scriptRenderResults);
+    $('checkScriptBtn').addEventListener('click', scriptRun);
+
+    $('clearScriptBtn').addEventListener('click', () => {
+        scriptCm.setValue('');
+        currentScript = null;
+        scriptUndoBuffer = null;
+        clearScriptIssueMarks();
+        scriptResultsBody.innerHTML = '';
+        scriptIssueCountBadge.textContent = '0 Errors';
+        scriptIssueCountBadge.className = 'badge';
+        scriptSummaryText.textContent = 'Ready to Check';
+        $('fixScriptBtn').disabled = true;
+        $('undoScriptBtn').disabled = true;
+        $('exportScriptBtn').disabled = true;
+        scriptShowState('empty');
+    });
+
+    $('fixScriptBtn').addEventListener('click', () => {
+        if (!currentScript) return;
+        scriptUndoBuffer = scriptCm.getValue();
+        const res = applyFixes(scriptUndoBuffer, currentScript.findings);
+        scriptCm.setValue(res.sql);
+        $('undoScriptBtn').disabled = false;
+        scriptRun();
+        flash('Applied ' + res.count + ' fix' + (res.count === 1 ? '' : 'es') + '. Review before deploying.');
+    });
+
+    $('formatScriptBtn').addEventListener('click', () => {
+        const sql = scriptCm.getValue();
+        if (!sql.trim()) { flash('Nothing to format.'); return; }
+        scriptUndoBuffer = sql;
+        scriptCm.setValue(formatSql(sql));
+        $('undoScriptBtn').disabled = false;
+        flash('SQL formatted.');
+    });
+
+    $('undoScriptBtn').addEventListener('click', () => {
+        if (scriptUndoBuffer === null) return;
+        scriptCm.setValue(scriptUndoBuffer);
+        scriptUndoBuffer = null;
+        $('undoScriptBtn').disabled = true;
+        if (scriptCm.getValue().trim()) scriptRun();
+        flash('Reverted.');
+    });
+
+    $('copyScriptBtn').addEventListener('click', () => copyText(scriptCm.getValue(), 'SQL copied.'));
+
+    $('exportScriptBtn').addEventListener('click', () => {
+        if (!currentScript || !currentScript.findings.length) return;
+        const rows = scriptVisibleRows();
+        const q = v => '"' + String(v).replace(/"/g, '""') + '"';
+        const csv = [['Line', 'Type', 'Rule', 'Object', 'Error', 'Context'].join(',')].concat(
+            rows.map(f => [f.line, f.cat.toUpperCase(), f.rule, f.obj, f.msg, f.ctx].map(q).join(','))
+        ).join('\r\n');
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' }));
+        a.download = 'script_check.csv';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        flash('Exported ' + rows.length + ' rows.');
+    });
+
+    $('collapseAllBtn').addEventListener('click', () => {
+        CodeMirror.commands.foldAll(scriptCm);
+        flash('Collapsed every batch.');
+    });
+    $('expandAllBtn').addEventListener('click', () => CodeMirror.commands.unfoldAll(scriptCm));
+
+    setupDropZone($('scriptDrop'), text => scriptCm.setValue(text), scriptRun);
+    makeResizable($('scriptView'), $('scriptResizer'), '--script-split', 'sqltools-script-split',
+        () => scriptCm.refresh());
+
+    document.addEventListener('keydown', e => {
+        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+            e.preventDefault();
+            const mode = activeMode();
+            if (mode === 'compare') refreshCompare();
+            else scriptRun();
+        }
+    });
+
+    updateScriptMeta();
     refreshCompare();
 });
