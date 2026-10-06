@@ -31,7 +31,8 @@
                 <button id="collapseAllBtn" class="secondary-btn" title="Collapse every CREATE PROCEDURE / FUNCTION / TRIGGER / VIEW batch">COLLAPSE ALL</button>
                 <button id="expandAllBtn" class="secondary-btn" title="Expand everything">EXPAND ALL</button>
                 <button id="copyScriptBtn" class="secondary-btn">COPY SQL</button>
-                <button id="exportScriptBtn" class="secondary-btn" disabled>EXPORT</button>
+                <button id="exportScriptBtn" class="secondary-btn" title="Export the rows currently shown (tab + filter) as CSV" disabled>EXPORT CSV</button>
+                <button id="exportScriptXlsxBtn" class="secondary-btn" title="Export the rows currently shown (tab + filter) to Excel" disabled>EXPORT EXCEL</button>
                 <button id="checkScriptBtn" class="primary-btn" title="Ctrl + Enter">RUN CHECK</button>
                 <button id="clearScriptBtn" class="secondary-btn">CLEAR</button>
             </div>
@@ -105,7 +106,7 @@
                         <button class="tab" data-tab="nocount">NO NOCOUNT</button>
                         <button class="tab" data-tab="go">MISSING GO</button>
                     </div>
-                    <input id="scriptSearchBox" class="search-box" type="text" spellcheck="false" placeholder="Filter...">
+                    <input id="scriptSearchBox" class="search-box" type="text" aria-label="Filter findings" spellcheck="false" placeholder="Filter...">
                 </div>
 
                 <div id="scriptResultsTableContainer" class="table-container hidden">
@@ -114,6 +115,7 @@
                             <tr>
                                 <th class="sortable" data-sort="line">Line</th>
                                 <th class="sortable" data-sort="type">Type</th>
+                                <th class="sortable" data-sort="sp">SP</th>
                                 <th class="sortable" data-sort="obj">Object</th>
                                 <th>Error</th>
                                 <th>Context</th>

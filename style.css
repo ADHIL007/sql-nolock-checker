@@ -179,6 +179,12 @@ section {
     line-height: 1.4rem;
 }
 
+/* cursorHeight: 0.7 (script.js) draws the caret top-aligned in the line box;
+   push it down by half the leftover (0.3 * 1.4rem / 2) so it sits on the text. */
+.editor-wrapper .CodeMirror-cursor {
+    margin-top: 0.21rem;
+}
+
 .CodeMirror-gutters {
     background: #f1f3f5;
     border-right: 1px solid var(--border-color);
@@ -243,16 +249,14 @@ section {
 
 /* Scrollbar preview marks (addon/scroll/annotatescrollbar) - same solid
    colour as that finding's accent bar/tag, so the scrollbar shows at a
-   glance where every issue sits before you scroll to it. The addon sizes
-   each mark to the native scrollbar's own width and clamps height to a
-   3px minimum, which measures out to a near-invisible sliver (the native
-   track itself is often only 6-7px wide) - widened and thickened here,
-   plus a dark hairline so the colour still reads against a light track. */
+   glance where every issue sits before you scroll to it. Pinned to the
+   scrollbar's exact 4px width and right edge; height thickened from the
+   addon's 3px minimum so short marks stay visible. */
 [class^="cm-scrollmark-"] {
-    width: 13px !important;
+    width: 4px !important;         /* same as the native scrollbar below */
+    right: 0 !important;
     min-height: 7px;
-    border-radius: 2px;
-    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+    border-radius: 0;
 }
 
 .cm-scrollmark-nolock   { background: var(--amber); }
@@ -388,8 +392,8 @@ button:hover {
 }
 
 ::-webkit-scrollbar {
-    width: 6px;
-    height: 6px;
+    width: 4px;
+    height: 4px;
 }
 
 ::-webkit-scrollbar-track {
@@ -397,11 +401,11 @@ button:hover {
 }
 
 ::-webkit-scrollbar-thumb {
-    background: #dee2e6;
+    background: #000;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-    background: #adb5bd;
+    background: #333;
 }
 
 /* ==========================================================================
@@ -499,6 +503,11 @@ button:disabled:hover {
     min-width: 120px;
     outline: none;
     color: var(--text-primary);
+}
+
+.sp-cell {
+    white-space: nowrap;
+    font-weight: 600;
 }
 
 .search-box::placeholder {

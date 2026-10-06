@@ -1138,6 +1138,17 @@ function analyzeScript(sql) {
     analyzeGo(sql, codeDoc, lineOf, objs, result.findings);
     result.findings.sort((a, b) => (a.line - b.line) || (a.off - b.off));
 
+    /* Tag each finding with the CREATE/ALTER object it sits inside (last
+       header at or above its line); anything before the first header is
+       loose script. Matched by line, not offset, since dynamic-SQL refs
+       carry offsets into a rewritten doc. */
+    const objLines = objs.map(o => ({ name: o.name, line: lineOf(o.s) }));
+    result.findings.forEach(f => {
+        let owner = '';
+        for (let i = 0; i < objLines.length && objLines[i].line <= f.line; i++) owner = objLines[i].name;
+        f.sp = owner || '(script)';
+    });
+
     const counts = { PROCEDURE: 0, FUNCTION: 0, TRIGGER: 0, VIEW: 0 };
     objs.forEach(o => { counts[o.kind]++; });
     result.objectCounts = counts;
@@ -1369,7 +1380,8 @@ const CM_OPTIONS = {
     lineNumbers: true,
     tabSize: 4,
     indentUnit: 4,
-    lineWrapping: false
+    lineWrapping: false,
+    cursorHeight: 0.7   /* glyph height, not the full 1.4rem line box; centred via CSS */
 };
 
 /* Script Check only: folds a CREATE/ALTER PROCEDURE|FUNCTION|TRIGGER|VIEW
@@ -1840,13 +1852,15 @@ document.addEventListener('DOMContentLoaded', () => {
         SEVERITY_CLASSES.forEach(c => scriptScrollAnns[c].update([]));
     }
 
-    function markScriptIssues() {
+    /* Marks only the rows passed in (the current tab / SP / text filter), so
+       the line highlights and scrollbar marks always match the table. */
+    function markScriptIssues(rows) {
         clearScriptIssueMarks();
         if (!currentScript) return;
         const bySeverity = {};
         SEVERITY_CLASSES.forEach(c => { bySeverity[c] = []; });
         scriptCm.operation(() => {
-            currentScript.findings.forEach(f => {
+            rows.forEach(f => {
                 const style = findingStyle(f);
                 scriptCm.addLineClass(f.line - 1, 'background', 'cm-issue-' + style.cls);
                 scriptCm.addLineClass(f.line - 1, 'gutter', 'cm-gutter-' + style.cls);
@@ -1860,19 +1874,33 @@ document.addEventListener('DOMContentLoaded', () => {
         scriptMeta.textContent = scriptCm.lineCount() + ' LINES / ' + scriptCm.getValue().length + ' CHARS';
     }
 
+    /* Re-check automatically once typing pauses. Old results stay on screen
+       meanwhile, but AUTO FIX / EXPORT are disabled since their offsets and
+       line numbers are stale until the re-run lands. */
+    let scriptAutoRunTimer = null;
     scriptCm.on('change', () => {
         updateScriptMeta();
-        if (currentScript) {
+        clearTimeout(scriptAutoRunTimer);
+        if (!scriptCm.getValue().trim()) {
             currentScript = null;
             clearScriptIssueMarks();
             scriptResultsBody.innerHTML = '';
             scriptIssueCountBadge.textContent = '0 Errors';
             scriptIssueCountBadge.className = 'badge';
-            scriptSummaryText.textContent = 'Edited - Run Check again';
+            scriptSummaryText.textContent = 'Ready to Check';
             $('fixScriptBtn').disabled = true;
             $('exportScriptBtn').disabled = true;
+            $('exportScriptXlsxBtn').disabled = true;
             scriptShowState('empty');
+            return;
         }
+        if (currentScript) {
+            scriptSummaryText.textContent = 'Checking...';
+            $('fixScriptBtn').disabled = true;
+            $('exportScriptBtn').disabled = true;
+            $('exportScriptXlsxBtn').disabled = true;
+        }
+        scriptAutoRunTimer = setTimeout(scriptRun, 500);
     });
 
     function scriptShowState(state) {
@@ -1885,11 +1913,11 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function scriptRun() {
+        clearTimeout(scriptAutoRunTimer);
         const sql = scriptCm.getValue();
         if (!sql.trim()) { flash('Nothing to check.'); return; }
 
         currentScript = analyzeScript(sql);
-        markScriptIssues();
 
         const security = currentScript.findings.filter(f => f.cat === 'security').length;
         const nolock = currentScript.findings.filter(f => f.cat === 'nolock').length;
@@ -1906,6 +1934,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         $('fixScriptBtn').disabled = !currentScript.findings.some(f => f.fix);
         $('exportScriptBtn').disabled = !currentScript.findings.length;
+        $('exportScriptXlsxBtn').disabled = !currentScript.findings.length;
         scriptRenderResults();
     }
 
@@ -1915,12 +1944,13 @@ document.addEventListener('DOMContentLoaded', () => {
         let rows = currentScript.findings.filter(f => scriptTab === 'all' || f.cat === scriptTab);
         if (q) {
             rows = rows.filter(f =>
-                (f.line + ' ' + f.obj + ' ' + f.rule + ' ' + f.msg + ' ' + f.ctx).toLowerCase().indexOf(q) >= 0);
+                (f.line + ' ' + f.sp + ' ' + f.obj + ' ' + f.rule + ' ' + f.msg + ' ' + f.ctx).toLowerCase().indexOf(q) >= 0);
         }
         rows.sort((a, b) => {
             let d = 0;
             if (scriptSortKey === 'line') d = a.line - b.line;
             else if (scriptSortKey === 'type') d = a.cat < b.cat ? -1 : a.cat > b.cat ? 1 : 0;
+            else if (scriptSortKey === 'sp') d = a.sp.toLowerCase() < b.sp.toLowerCase() ? -1 : a.sp.toLowerCase() > b.sp.toLowerCase() ? 1 : 0;
             else if (scriptSortKey === 'obj') d = a.obj.toLowerCase() < b.obj.toLowerCase() ? -1 : 1;
             return d * scriptSortDir || a.off - b.off;
         });
@@ -1929,6 +1959,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function scriptRenderResults() {
         const rows = scriptVisibleRows();
+        markScriptIssues(rows);
         if (!rows.length) {
             scriptResultsBody.innerHTML = '';
             if (!currentScript) { scriptShowState('empty'); return; }
@@ -1949,6 +1980,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 '<td><span class="tag tag-' + style.cls + '">' + style.tagLabel + '</span>' +
                 (f.dynamic ? '<span class="tag tag-dyn">DYN</span>' : '') +
                 (f.fix ? '<span class="fixable" title="auto fixable">&#9670;</span>' : '') + '</td>' +
+                '<td class="sp-cell">' + escHtml(f.sp) + '</td>' +
                 '<td class="obj-cell"><b>' + escHtml(f.obj) + '</b></td>' +
                 '<td class="issue-cell">' + escHtml(f.msg) + '</td>' +
                 '<td class="snippet-cell">' + escHtml(f.ctx) + '</td>' +
@@ -2007,6 +2039,7 @@ document.addEventListener('DOMContentLoaded', () => {
         $('fixScriptBtn').disabled = true;
         $('undoScriptBtn').disabled = true;
         $('exportScriptBtn').disabled = true;
+        $('exportScriptXlsxBtn').disabled = true;
         scriptShowState('empty');
     });
 
@@ -2040,20 +2073,133 @@ document.addEventListener('DOMContentLoaded', () => {
 
     $('copyScriptBtn').addEventListener('click', () => copyText(scriptCm.getValue(), 'SQL copied.'));
 
-    $('exportScriptBtn').addEventListener('click', () => {
-        if (!currentScript || !currentScript.findings.length) return;
-        const rows = scriptVisibleRows();
-        const q = v => '"' + String(v).replace(/"/g, '""') + '"';
-        const csv = [['Line', 'Type', 'Rule', 'Object', 'Error', 'Context'].join(',')].concat(
-            rows.map(f => [f.line, f.cat.toUpperCase(), f.rule, f.obj, f.msg, f.ctx].map(q).join(','))
-        ).join('\r\n');
+    const EXPORT_HEADERS = ['Line', 'Type', 'Rule', 'SP', 'Object', 'Error', 'Context'];
+    const exportRow = f => [f.line, f.cat.toUpperCase(), f.rule, f.sp, f.obj, f.msg, f.ctx];
+
+    function downloadBlob(blob, name) {
         const a = document.createElement('a');
-        a.href = URL.createObjectURL(new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' }));
-        a.download = 'script_check.csv';
+        a.href = URL.createObjectURL(blob);
+        a.download = name;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    }
+
+    /* tab suffix so the file name says which slice was exported */
+    function exportName(ext) {
+        const q = scriptSearchBox.value.trim();
+        return 'script_check_' + scriptTab + (q ? '_filtered' : '') + '.' + ext;
+    }
+
+    $('exportScriptBtn').addEventListener('click', () => {
+        if (!currentScript || !currentScript.findings.length) return;
+        const rows = scriptVisibleRows();
+        if (!rows.length) { flash('Nothing to export in this view.'); return; }
+        const q = v => '"' + String(v).replace(/"/g, '""') + '"';
+        const csv = [EXPORT_HEADERS.join(',')].concat(
+            rows.map(f => exportRow(f).map(q).join(','))
+        ).join('\r\n');
+        downloadBlob(new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' }), exportName('csv'));
         flash('Exported ' + rows.length + ' rows.');
+    });
+
+    /* ---- minimal .xlsx writer: one sheet, inline strings, ZIP "stored" (no deflate) ---- */
+    const CRC_TABLE = (() => {
+        const t = new Uint32Array(256);
+        for (let n = 0; n < 256; n++) {
+            let c = n;
+            for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+            t[n] = c >>> 0;
+        }
+        return t;
+    })();
+
+    function crc32(bytes) {
+        let c = 0xFFFFFFFF;
+        for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+        return (c ^ 0xFFFFFFFF) >>> 0;
+    }
+
+    function zipStore(files) {
+        const enc = new TextEncoder();
+        const parts = [], central = [];
+        let offset = 0;
+        files.forEach(f => {
+            const name = enc.encode(f.name), data = enc.encode(f.data), crc = crc32(data);
+            const lh = new DataView(new ArrayBuffer(30));
+            lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true);
+            lh.setUint32(14, crc, true); lh.setUint32(18, data.length, true); lh.setUint32(22, data.length, true);
+            lh.setUint16(26, name.length, true);
+            const ch = new DataView(new ArrayBuffer(46));
+            ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true);
+            ch.setUint16(8, 0x0800, true);
+            ch.setUint32(16, crc, true); ch.setUint32(20, data.length, true); ch.setUint32(24, data.length, true);
+            ch.setUint16(28, name.length, true); ch.setUint32(42, offset, true);
+            parts.push(lh.buffer, name, data);
+            central.push(ch.buffer, name);
+            offset += 30 + name.length + data.length;
+        });
+        let cdSize = 0;
+        central.forEach(p => { cdSize += p.byteLength; });
+        const end = new DataView(new ArrayBuffer(22));
+        end.setUint32(0, 0x06054b50, true);
+        end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+        end.setUint32(12, cdSize, true); end.setUint32(16, offset, true);
+        return new Blob(parts.concat(central, [end.buffer]),
+            { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    }
+
+    function buildXlsx(rows) {
+        const esc = v => String(v).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
+            .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '');
+        const colName = i => String.fromCharCode(65 + i);
+        const cell = (v, r, c, bold) => typeof v === 'number'
+            ? '<c r="' + colName(c) + r + '"><v>' + v + '</v></c>'
+            : '<c r="' + colName(c) + r + '" t="inlineStr"' + (bold ? ' s="1"' : ' s="2"') +
+              '><is><t xml:space="preserve">' + esc(v) + '</t></is></c>';
+        const all = [EXPORT_HEADERS].concat(rows);
+        const sheetRows = all.map((row, i) =>
+            '<row r="' + (i + 1) + '">' + row.map((v, c) => cell(v, i + 1, c, i === 0)).join('') + '</row>').join('');
+        const widths = [8, 12, 12, 32, 32, 60, 70];
+        const X = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
+        const NS = 'http://schemas.openxmlformats.org/';
+        return zipStore([
+            { name: '[Content_Types].xml', data: X + '<Types xmlns="' + NS + 'package/2006/content-types">' +
+                '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+                '<Default Extension="xml" ContentType="application/xml"/>' +
+                '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+                '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' +
+                '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>' },
+            { name: '_rels/.rels', data: X + '<Relationships xmlns="' + NS + 'package/2006/relationships">' +
+                '<Relationship Id="rId1" Type="' + NS + 'officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>' },
+            { name: 'xl/workbook.xml', data: X + '<workbook xmlns="' + NS + 'spreadsheetml/2006/main" xmlns:r="' + NS + 'officeDocument/2006/relationships">' +
+                '<sheets><sheet name="Findings" sheetId="1" r:id="rId1"/></sheets></workbook>' },
+            { name: 'xl/_rels/workbook.xml.rels', data: X + '<Relationships xmlns="' + NS + 'package/2006/relationships">' +
+                '<Relationship Id="rId1" Type="' + NS + 'officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>' +
+                '<Relationship Id="rId2" Type="' + NS + 'officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>' },
+            { name: 'xl/styles.xml', data: X + '<styleSheet xmlns="' + NS + 'spreadsheetml/2006/main">' +
+                '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts>' +
+                '<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>' +
+                '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>' +
+                '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
+                '<cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>' +
+                '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>' +
+                '<xf numFmtId="49" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs></styleSheet>' },
+            { name: 'xl/worksheets/sheet1.xml', data: X + '<worksheet xmlns="' + NS + 'spreadsheetml/2006/main">' +
+                '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>' +
+                '<cols>' + widths.map((w, i) => '<col min="' + (i + 1) + '" max="' + (i + 1) + '" width="' + w + '" customWidth="1"/>').join('') + '</cols>' +
+                '<sheetData>' + sheetRows + '</sheetData>' +
+                '<autoFilter ref="A1:' + colName(EXPORT_HEADERS.length - 1) + all.length + '"/></worksheet>' }
+        ]);
+    }
+
+    $('exportScriptXlsxBtn').addEventListener('click', () => {
+        if (!currentScript || !currentScript.findings.length) return;
+        const rows = scriptVisibleRows();
+        if (!rows.length) { flash('Nothing to export in this view.'); return; }
+        downloadBlob(buildXlsx(rows.map(exportRow)), exportName('xlsx'));
+        flash('Exported ' + rows.length + ' rows to Excel.');
     });
 
     $('collapseAllBtn').addEventListener('click', () => {
